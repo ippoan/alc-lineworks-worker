@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 # 口 (`routes`)・入力の検証 (`body`)・秘密値の復号 (`secret`)・JWT (`jwt`)・LINE WORKS の呼び方と token の cache (`client`)・
-# SQL を流す実装 (`pg`)・送信の流れ (`send`) を持ち、native でも wasm32-unknown-unknown でもビルドできる
+# SQL を流す実装 (`pg`)・ログイン状況の集計 (`activity`) を持ち、native でも wasm32-unknown-unknown でもビルドできる
 # (接続も HTTP の実装も持たない。張るのは直下の worker と tests/)。
 [dependencies]
 # 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
@@ -13,8 +13,14 @@ alc-core-wasm = { workspace = true }
 alc-worker-db = { workspace = true }
 # client_secret の復号 (rust-alc-api の decrypt_secret と同じ AES-256-GCM)。pure Rust で wasm32 に載る
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-axum = { version = "0.8", default-features = false, features = ["json"] }
+axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# 監査ログ・掲示板の日時 (時計は使わない。「今」は呼び手から渡す)
+chrono = { version = "0.4", default-features = false, features = ["alloc", "std"] }
+# 監査ログの CSV (rust-alc-api の parse_login_audit_csv と同じ読み方)。pure Rust
+csv = "1"
+# 監査ログの CSV が UTF-8 でないときの Shift_JIS (rust の decode_csv_bytes と同じ)
+encoding_rs = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # JWT (RS256) の署名。PKCS#1 / PKCS#8 の PEM を読む (署名は乱数を使わない形。wasm32 に載る)
 rsa = { version = "0.9", default-features = false, features = ["std", "pem", "u64_digit"] }

@@ -1,4 +1,4 @@
-//! 3 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
+//! 5 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
 //! 接続先は `LINEWORKS_TEST_ADMIN_DATABASE_URL` (無ければ失敗する。tests/support)。
 
 mod support;
@@ -986,4 +986,473 @@ async fn app_with(opts: Opts) -> App {
 fn broken_pem() -> String {
     let d = "-".repeat(5);
     format!("{d}BEGIN PRIVATE KEY{d}\nAAAA\n{d}END PRIVATE KEY{d}")
+}
+
+// ---- users / login-activity (Refs ippoan/rust-alc-api#747) ----
+
+const USERS_PAGE_1: &str = r#"{"users":[{"userId":"u1","userName":{"lastName":"田中","firstName":"太郎"},"email":"a@x.com"},{"userId":"u2","userName":{"lastName":"鈴木"},"email":"B@x.com"}],"responseMetaData":{"nextCursor":"c+1="}}"#;
+const USERS_PAGE_2: &str = r#"{"users":[{"userId":"u3","email":"c@x.com"},{"userId":"u4","email":"d@x.com"},{"userId":"u5","email":"e@x.com"}],"responseMetaData":{}}"#;
+
+/// users の 2 ページを返す偽の LINE WORKS
+fn with_users(http: FakeLineworks) -> FakeLineworks {
+    http.on_get(
+        &format!("{USERS_URL}?cursor=c%2B1%3D"),
+        200,
+        USERS_PAGE_2,
+        None,
+    )
+    .on_get(USERS_URL, 200, USERS_PAGE_1, None)
+}
+
+/// `NOW` の `d` 日前 (秒は `NOW` と同じ)
+fn days_ago(d: u64) -> chrono::DateTime<chrono::Utc> {
+    lineworks::activity::to_datetime(NOW - d * 86_400)
+}
+
+/// 監査ログの API の時刻の形 (URL に入る前)
+fn audit_time(t: chrono::DateTime<chrono::Utc>) -> String {
+    lineworks::client::form_urlencode(&[("t", &lineworks::client::format_audit_time(t))])[2..]
+        .to_owned()
+}
+
+/// users の口: bot_config_id が無ければ既定の bot、在ればその bot で token (scope directory.read) を取り、
+/// cursor で 2 ページ取って rust の `LineworksMember` の形で返す
+#[tokio::test]
+async fn users_pages_and_bot_selection() {
+    let t = tenant().await;
+    let other = tenant().await;
+    bot(other, "0-other-tenant", "lineworks", true).await;
+    bot(t, "1-disabled", "lineworks", false).await;
+    let first = bot(t, "3-first", "lineworks", true).await;
+    let second = bot(t, "4-second", "lineworks", false).await;
+    let app = app(Opts {
+        http: with_users(FakeLineworks::default()),
+        ..Default::default()
+    })
+    .await;
+    let tid = t.to_string();
+
+    let got = users(&app, Some(&tid), "").await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            200,
+            serde_json::json!([
+                {"user_id": "u1", "user_name": "田中 太郎", "email": "a@x.com"},
+                {"user_id": "u2", "user_name": "鈴木", "email": "B@x.com"},
+                {"user_id": "u3", "user_name": null, "email": "c@x.com"},
+                {"user_id": "u4", "user_name": null, "email": "d@x.com"},
+                {"user_id": "u5", "user_name": null, "email": "e@x.com"},
+            ])
+        )
+    );
+    let got = users(&app, Some(&tid), &format!("bot_config_id={}", second.id)).await;
+    assert_eq!(got.status, 200);
+
+    let seen = app.http.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "bot ごとに token 1 回");
+    assert_eq!(form_value(&seen[0].body, "client_id"), first.client_id);
+    assert_eq!(form_value(&seen[1].body, "client_id"), second.client_id);
+    assert_eq!(
+        app.http.token_scopes(),
+        ["directory.read", "directory.read"]
+    );
+    let gets = app.http.seen_gets.lock().unwrap().clone();
+    assert_eq!(gets.len(), 4);
+    assert_eq!(gets[0].0, USERS_URL);
+    assert_eq!(gets[1].0, format!("{USERS_URL}?cursor=c%2B1%3D"));
+    assert!(gets.iter().all(|(_, a)| a == "Bearer tok-1"));
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// users の口の誤り: 401・404 (別 tenant の bot = RLS + WHERE tenant_id)・400 (query が読めない)・
+/// LINE WORKS が権限で断った 403 `missing_scope`・ほかの上流の失敗 502 (本文は載せない)・DB の失敗 500
+#[tokio::test]
+async fn users_errors() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let empty = tenant().await;
+    let b = bot(t, "main", "lineworks", true).await;
+    let foreign = bot(other, "foreign", "lineworks", true).await;
+    let app = app(Opts::default()).await;
+    let tid = t.to_string();
+
+    for tenant in [None, Some("x")] {
+        assert_eq!(users(&app, tenant, "").await.status, 401);
+        assert_eq!(login_activity(&app, tenant, "days=3").await.status, 401);
+    }
+    for (tenant, q) in [
+        (t, format!("bot_config_id={}", foreign.id)),
+        (t, format!("bot_config_id={}", Uuid::new_v4())),
+        (empty, String::new()),
+    ] {
+        for got in [
+            users(&app, Some(&tenant.to_string()), &q).await,
+            login_activity(&app, Some(&tenant.to_string()), &q).await,
+        ] {
+            assert_eq!(
+                (got.status, got.json()),
+                (404, serde_json::json!({"error": "bot_config_not_found"}))
+            );
+        }
+    }
+    assert_eq!(users(&app, Some(&tid), "bot_config_id=x").await.status, 400);
+    assert_eq!(
+        login_activity(&app, Some(&tid), "days=abc").await.status,
+        400
+    );
+    assert!(app.http.seen.lock().unwrap().is_empty());
+    assert!(app.http.seen_gets.lock().unwrap().is_empty());
+
+    let secret_body = r#"{"code":"FORBIDDEN","description":"u1 a@x.com"}"#;
+    let cases = [
+        (
+            FakeLineworks::default().on_get(USERS_URL, 403, secret_body, None),
+            403,
+            serde_json::json!({"error": "missing_scope", "scope": "directory.read", "message": "LINE WORKS Developer Console で directory.read scope を追加してください"}),
+            "lineworks-read: Read users failed: HTTP 403 (FORBIDDEN)",
+        ),
+        (
+            FakeLineworks::default().on_get(USERS_URL, 500, "<html>a@x.com</html>", None),
+            502,
+            serde_json::json!({"error": "upstream_error", "message": "Read users failed: HTTP 500"}),
+            "lineworks-read: Read users failed: HTTP 500",
+        ),
+        (
+            FakeLineworks::default().on_get(USERS_URL, 200, "a@x.com", None),
+            502,
+            serde_json::json!({"error": "upstream_error", "message": "Read users failed: parse"}),
+            "lineworks-read: Read users failed: parse",
+        ),
+        (
+            FakeLineworks {
+                unreachable: true,
+                ..Default::default()
+            },
+            502,
+            serde_json::json!({"error": "upstream_error", "message": "HTTP error: token"}),
+            "lineworks-read: HTTP error: token",
+        ),
+    ];
+    for (http, status, body, log) in cases {
+        let app = app_with(Opts {
+            http,
+            ..Default::default()
+        })
+        .await;
+        for got in [
+            users(&app, Some(&tid), "").await,
+            login_activity(&app, Some(&tid), "").await,
+        ] {
+            assert_eq!((got.status, got.json()), (status, body.clone()));
+        }
+        assert_eq!(*app.logs.lock().unwrap(), [log, log]);
+        assert_logs_clean(&app, &["u1", "a@x.com", &tid, "secret-main"]);
+    }
+
+    // DB の失敗 (bot_configs を読めないロール)
+    for (q, want) in [
+        (format!("bot_config_id={}", b.id), "get_bot_config_failed"),
+        (String::new(), "list_bot_configs_failed"),
+    ] {
+        let app = build(client_as(NO_BOT_ROLE).await, Opts::default());
+        for got in [
+            users(&app, Some(&tid), &q).await,
+            login_activity(&app, Some(&tid), &q).await,
+        ] {
+            assert_eq!(
+                (got.status, got.json()),
+                (
+                    500,
+                    serde_json::json!({"error": "internal_error", "message": want})
+                )
+            );
+        }
+        assert!(app.http.seen.lock().unwrap().is_empty());
+    }
+}
+
+/// login-activity の偽の LINE WORKS: users 2 ページ・auth の監査ログ (別ホストへ 302 を 2 回)・message の監査ログ・掲示板
+fn activity_http() -> FakeLineworks {
+    // auth: a@ 1 日前 (JST の時刻の形) / B@ 5 日前と 10 日前 (新しい方) / c@ は失敗だけ
+    let jst = |d| (days_ago(d) + chrono::Duration::hours(9)).format("%Y/%m/%d %H:%M:%S");
+    let auth = format!(
+        "説明,メンバー,日時,IPアドレス,ログイン方法,サービスタイプ\n\
+         ログインに成功しました,田中太郎 (A@x.com),{},1.2.3.4,パスワード,ブラウザ\n\
+         ログインに成功しました,鈴木 (b@x.com),{},1.2.3.4,パスワード,モバイルアプリ\n\
+         ログインに成功しました,鈴木 (b@x.com),{},1.2.3.4,パスワード,モバイルアプリ\n\
+         ログインに失敗しました (エラーコード: 401),c (c@x.com),{},1.2.3.4,パスワード,ブラウザ\n",
+        jst(1),
+        days_ago(10).to_rfc3339(),
+        days_ago(5).to_rfc3339(),
+        days_ago(2).to_rfc3339(),
+    );
+    // message: c@ 2 日前、a@ 4 日前 (auth の方が新しい)
+    let message = format!(
+        "日時,送信者,受信者,チャンネルID,イベント\n{},c (c@x.com),a (a@x.com),ch,送信\n{},a (a@x.com),c (c@x.com),ch,送信\n",
+        days_ago(2).to_rfc3339(),
+        days_ago(4).to_rfc3339(),
+    );
+    let posts = serde_json::json!({"posts": [
+        {"postId": 1_000_000_000_000_000_001u64, "createdTime": days_ago(7).to_rfc3339()},
+        {"postId": 2, "createdTime": days_ago(40).to_rfc3339()},
+    ]})
+    .to_string();
+    with_users(FakeLineworks::default())
+        .on_get("https://dl.test/final", 200, &auth, None)
+        .on_get("https://dl.test/hop", 302, "", Some("https://dl.test/final"))
+        .on_get(
+            &format!("{AUDIT_URL}?service=auth&"),
+            302,
+            "",
+            Some("https://dl.test/hop"),
+        )
+        .on_get(&format!("{AUDIT_URL}?service=message&"), 200, &message, None)
+        .on_get(
+            &format!("{BOARDS_URL}/4000000000000000001/posts/1000000000000000001/readers"),
+            200,
+            r#"{"readers":[{"userId":"u4","isRead":true},{"userId":"u5","isRead":false},{"userId":"u9","isRead":true}]}"#,
+            None,
+        )
+        .on_get(
+            &format!("{BOARDS_URL}/4000000000000000001/posts?count=40"),
+            200,
+            &posts,
+            None,
+        )
+        .on_get(
+            BOARDS_URL,
+            200,
+            r#"{"boards":[{"boardId":4000000000000000001}]}"#,
+            None,
+        )
+}
+
+/// login-activity: 3 つの信号の合成・`days` のしきい値・並び (記録なしが先頭、その次は古い順)・JSON の形・
+/// 監査ログの窓 (now − 30 日 〜 now) とリダイレクトの Authorization の付け直し・cache (5 分の間は監査ログを取り直さない)
+#[tokio::test]
+async fn login_activity_end_to_end() {
+    let t = tenant().await;
+    bot(t, "main", "lineworks", true).await;
+    let activity = Arc::new(lineworks::activity::ActivityCache::default());
+    let app = app(Opts {
+        http: activity_http(),
+        activity: activity.clone(),
+        ..Default::default()
+    })
+    .await;
+    let tid = t.to_string();
+
+    let got = login_activity(&app, Some(&tid), "days=3").await;
+    assert_eq!(got.status, 200);
+    let entry = |user_id: &str,
+                 name: Option<&str>,
+                 email: &str,
+                 days: Option<u64>,
+                 stale: bool,
+                 source: Option<&str>| {
+        serde_json::json!({
+            "user_id": user_id,
+            "user_name": name,
+            "email": email,
+            "last_login_at": days.map(|d| days_ago(d).to_rfc3339()),
+            "days_since_login": days,
+            "stale": stale,
+            "last_login_source": source,
+        })
+    };
+    assert_eq!(
+        got.json(),
+        serde_json::json!([
+            entry("u5", None, "e@x.com", None, true, None),
+            entry("u4", None, "d@x.com", Some(7), true, Some("board")),
+            entry("u2", Some("鈴木"), "B@x.com", Some(5), true, Some("auth")),
+            entry("u3", None, "c@x.com", Some(2), false, Some("message")),
+            entry(
+                "u1",
+                Some("田中 太郎"),
+                "a@x.com",
+                Some(1),
+                false,
+                Some("auth")
+            ),
+        ])
+    );
+
+    let gets = app.http.seen_gets.lock().unwrap().clone();
+    let auth_url = format!(
+        "{AUDIT_URL}?service=auth&startTime={}&endTime={}&language=ja_JP",
+        audit_time(days_ago(30)),
+        audit_time(days_ago(0)),
+    );
+    let urls: Vec<&str> = gets.iter().map(|(u, _)| u.as_str()).collect();
+    assert_eq!(
+        urls[2..5],
+        [
+            auth_url.as_str(),
+            "https://dl.test/hop",
+            "https://dl.test/final"
+        ],
+        "監査ログの窓は 30 日、302 を辿る"
+    );
+    assert!(urls[5].starts_with(&format!("{AUDIT_URL}?service=message&startTime=")));
+    assert!(gets.iter().all(|(_, a)| a == "Bearer tok-1"));
+    assert_eq!(
+        app.http.token_scopes(),
+        ["directory.read", "audit.read", "board.read"]
+    );
+    assert!(app.logs.lock().unwrap().is_empty());
+    assert_eq!(activity.count().await, 1);
+
+    // days の既定は 3、負は 0 (記録のある人も全員 stale)。5 分の間は監査ログ・掲示板を取り直さない (users は毎回)
+    let n = gets.len();
+    let got = login_activity(&app, Some(&tid), "").await;
+    let stale: Vec<bool> = got
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["stale"].as_bool().unwrap())
+        .collect();
+    assert_eq!(stale, [true, true, true, false, false]);
+    let got = login_activity(&app, Some(&tid), "days=-5").await;
+    assert!(got
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["stale"] == true));
+    let urls = app.http.get_urls();
+    assert_eq!(urls.len(), n + 4);
+    assert!(urls[n..].iter().all(|u| u.starts_with(USERS_URL)));
+
+    // 299 秒後は cache から、300 秒たつと取り直す
+    let before = app_with(Opts {
+        http: activity_http(),
+        activity: activity.clone(),
+        now: NOW + 299,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(login_activity(&before, Some(&tid), "").await.status, 200);
+    assert!(!before
+        .http
+        .get_urls()
+        .iter()
+        .any(|u| u.starts_with(AUDIT_URL)));
+    let later = app_with(Opts {
+        http: activity_http(),
+        activity,
+        now: NOW + 300,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(login_activity(&later, Some(&tid), "").await.status, 200);
+    assert!(later
+        .http
+        .get_urls()
+        .iter()
+        .any(|u| u.starts_with(AUDIT_URL)));
+}
+
+/// login-activity の誤り: auth の監査ログ (必須) の失敗は口の失敗 (403 `missing_scope` audit.read / 502 / CSV の見出し)。
+/// message と掲示板は best-effort (固定の語をログに残して auth だけで返す)。記録なしの人だけでも 200
+#[tokio::test]
+async fn login_activity_errors() {
+    let t = tenant().await;
+    bot(t, "main", "lineworks", true).await;
+    let tid = t.to_string();
+    let auth = format!("{AUDIT_URL}?service=auth&");
+    let message = format!("{AUDIT_URL}?service=message&");
+    let cases = [
+        (
+            with_users(FakeLineworks::default()).on_get(
+                &auth,
+                403,
+                r#"{"code":"FORBIDDEN"}"#,
+                None,
+            ),
+            403,
+            serde_json::json!({"error": "missing_scope", "scope": "audit.read", "message": "LINE WORKS Developer Console で audit.read scope を追加してください"}),
+            "lineworks-read: Read audit failed: HTTP 403 (FORBIDDEN)",
+        ),
+        (
+            with_users(FakeLineworks::default())
+                .on_get(&auth, 302, "", Some("https://dl.test/x"))
+                .on_get(
+                    "https://dl.test/x",
+                    401,
+                    r#"{"code":"UNAUTHORIZED","description":"a@x.com"}"#,
+                    None,
+                ),
+            502,
+            serde_json::json!({"error": "upstream_error", "message": "Read audit failed: HTTP 401 (UNAUTHORIZED)"}),
+            "lineworks-read: Read audit failed: HTTP 401 (UNAUTHORIZED)",
+        ),
+        (
+            with_users(FakeLineworks::default()).on_get(&auth, 302, "", None),
+            502,
+            serde_json::json!({"error": "upstream_error", "message": "Read audit failed: redirect"}),
+            "lineworks-read: Read audit failed: redirect",
+        ),
+        (
+            with_users(FakeLineworks::default()).on_get(&auth, 200, "a@x.com,u1\n1,2\n", None),
+            502,
+            serde_json::json!({"error": "csv_columns_not_recognized", "message": "member/email column not found"}),
+            "lineworks-read: auth audit csv: member/email column not found",
+        ),
+    ];
+    for (http, status, body, log) in cases {
+        let app = app_with(Opts {
+            http,
+            ..Default::default()
+        })
+        .await;
+        let got = login_activity(&app, Some(&tid), "days=3").await;
+        assert_eq!((got.status, got.json()), (status, body));
+        assert_eq!(*app.logs.lock().unwrap(), [log]);
+        assert_logs_clean(&app, &["u1", "a@x.com", &tid]);
+    }
+
+    // best-effort: message が読めない CSV・掲示板が 403 → auth だけ。message が 500・掲示板が無い → auth だけ
+    let auth_csv = format!("メンバー,日時\na@x.com,{}\n", days_ago(1).to_rfc3339());
+    for (http, logs) in [
+        (
+            with_users(FakeLineworks::default())
+                .on_get(&auth, 200, &auth_csv, None)
+                .on_get(&message, 200, "x,y\n", None)
+                .on_get(BOARDS_URL, 403, "forbidden", None),
+            vec![
+                "lineworks-read: message audit skipped: member/email column not found",
+                "lineworks-read: board activity skipped: Read boards failed: HTTP 403",
+            ],
+        ),
+        (
+            with_users(FakeLineworks::default())
+                .on_get(&auth, 200, &auth_csv, None)
+                .on_get(&message, 500, "a@x.com", None)
+                .on_get(BOARDS_URL, 200, "{}", None),
+            vec!["lineworks-read: message audit skipped: Read audit failed: HTTP 500"],
+        ),
+    ] {
+        let app = app_with(Opts {
+            http,
+            ..Default::default()
+        })
+        .await;
+        let got = login_activity(&app, Some(&tid), "days=3").await;
+        assert_eq!(got.status, 200);
+        let rows = got.json();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["last_login_source"] == "auth")
+                .count(),
+            1
+        );
+        assert!(rows[..4].iter().all(|r| r["last_login_at"].is_null()));
+        assert_eq!(*app.logs.lock().unwrap(), logs);
+        assert_logs_clean(&app, &["u1", "a@x.com", &tid]);
+    }
 }
