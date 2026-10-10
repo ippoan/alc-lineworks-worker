@@ -1,0 +1,31 @@
+# 行カバレッジ 100% の登録簿 (ohishi-exp/rust-leave-worker・ippoan/alc-dtako-worker の同名のファイルの形。
+# Refs ohishi-exp/rust-leave-worker#1)。
+#
+#   bash scripts/fetch-migrations.sh
+#   LINEWORKS_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p lineworks --text > cov-lineworks.txt
+#   bash scripts/check_coverage_100.sh --use-cache cov-lineworks.txt
+#
+# 計測するのは `cargo test -p lineworks` の全部 = 各 module の単体テスト (純粋関数・偽の HTTP) と tests/send_db.rs
+# (口から実 DB・偽の LINE WORKS まで。接続先が無ければ失敗する)。
+# lib.rs は mod 宣言だけなので登録しない。
+# worker 本体 (直下の src/、wasm 専用。外への HTTP の実装 src/http.rs を含む) は native で計測できないので対象外。
+
+# client_secret の復号 (rust の ring の暗号文と相互に読めること)・PEM の改行
+[[files]]
+path = "crates/lineworks/src/secret.rs"
+
+# JWT の claim・RS256 の署名・PKCS#1 / PKCS#8 の PEM
+[[files]]
+path = "crates/lineworks/src/jwt.rs"
+
+# LINE WORKS の URL・form・token の取得と cache・送信・エラーの文
+[[files]]
+path = "crates/lineworks/src/client.rs"
+
+# SQL を流す 1 か所 (tests/send_db.rs が実 DB で通す)
+[[files]]
+path = "crates/lineworks/src/pg.rs"
+
+# 2 つの口 (400 / 401 / 404 / 405 / 422 / 500 / 502 の本文とログまで)
+[[files]]
+path = "crates/lineworks/src/routes.rs"
