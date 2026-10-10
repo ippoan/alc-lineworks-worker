@@ -1401,10 +1401,8 @@ pub(crate) mod tests {
         assert!(
             urls.contains(&"https://lw.test/boards/4000000000000000001/posts?count=40".to_owned())
         );
-        assert!(
-            !urls.iter().any(|u| u.contains("/b12/")),
-            "6 つ目の掲示板は見ない"
-        );
+        // 6 つ目の掲示板は見ない
+        assert!(!urls.iter().any(|u| u.contains("/b12/")));
         assert!(!urls
             .iter()
             .any(|u| u.contains("/posts/8/") || u.contains("/posts/9/")));

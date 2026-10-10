@@ -354,10 +354,8 @@ mod tests {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn audit_window_stays_under_the_31_day_api_limit() {
-        assert!(
-            AUDIT_WINDOW_DAYS < 31,
-            "31 ちょうどは LINE WORKS に断られる"
-        );
+        // 31 ちょうどは LINE WORKS に断られる (失敗の文を別の行に置くと、古い toolchain の coverage がその行を未実行と数える)
+        assert!(AUDIT_WINDOW_DAYS < 31);
         assert_eq!((CACHE_TTL_SECS, DEFAULT_DAYS), (300, 3));
     }
 
