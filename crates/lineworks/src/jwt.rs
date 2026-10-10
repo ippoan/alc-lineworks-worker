@@ -1,28 +1,16 @@
-//! LINE WORKS の Service Account 認証の JWT (RS256)。
+//! LINE WORKS の Service Account 認証の JWT (RS256) の claim。
 //!
 //! claim は rust-alc-api の `LineworksBotClient::issue_token` と同じ: `iss` = Client ID・`sub` = Service Account・
-//! `iat` = 今・`exp` = 今 + 60 秒。header は `{"alg":"RS256","typ":"JWT"}`。
+//! `iat` = 今・`exp` = 今 + 60 秒。署名は `alc_worker_crypto::jwt::sign_rs256(pem, None, &claims)` (header は kid なしの
+//! `{"alg":"RS256","typ":"JWT"}`。PKCS#1 / PKCS#8 の PEM と、1 行に `\n` (2 文字) で入れた PEM を読む)。
 //!
 //! Private Key は Secrets Store の `LINEWORKS_PRIVATE_KEY` の 1 か所だけから読む (bot_configs の `private_key_encrypted` は
-//! 読まない)。PKCS#1 (`BEGIN RSA PRIVATE KEY`) と PKCS#8 (`BEGIN PRIVATE KEY`) の両方を受け、実の改行が無く `\n` (2 文字) が
-//! 在れば改行に直す ([`crate::secret::normalize_pem_newlines`])。
+//! 読まない)。
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::signature::{SignatureEncoding, Signer};
-use rsa::RsaPrivateKey;
 use serde::Serialize;
-use sha2::Sha256;
-
-use crate::secret::normalize_pem_newlines;
 
 /// JWT の有効期間 (秒)
 pub const JWT_TTL_SECS: u64 = 60;
-
-const HEADER: &str = r#"{"alg":"RS256","typ":"JWT"}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Claims {
@@ -41,57 +29,26 @@ pub fn claims(client_id: &str, service_account: &str, now: u64) -> Claims {
     }
 }
 
-/// Private Key が読めない (中身は文に入れない)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyError;
-
-/// PEM (PKCS#1 か PKCS#8) を読む
-pub fn parse_private_key(pem: &str) -> Result<RsaPrivateKey, KeyError> {
-    let pem = normalize_pem_newlines(pem.trim());
-    if pem.contains("BEGIN RSA PRIVATE KEY") {
-        RsaPrivateKey::from_pkcs1_pem(&pem).map_err(|_| KeyError)
-    } else {
-        RsaPrivateKey::from_pkcs8_pem(&pem).map_err(|_| KeyError)
-    }
-}
-
-/// `header.payload.signature` (どれも base64url・padding なし)
-pub fn sign_rs256(key: &RsaPrivateKey, claims: &Claims) -> String {
-    let payload = serde_json::to_vec(claims).unwrap_or_default();
-    let input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(HEADER),
-        URL_SAFE_NO_PAD.encode(payload)
-    );
-    let signature = SigningKey::<Sha256>::new(key.clone()).sign(input.as_bytes());
-    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use alc_worker_crypto::jwt::sign_rs256;
+    use rand::SeedableRng;
     use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
-    use rsa::signature::Verifier;
+    use rsa::RsaPrivateKey;
     use std::sync::OnceLock;
 
-    /// テスト用の鍵 (生成は重いので 1 回だけ。1024 bit = テスト専用の大きさ)
-    pub(crate) fn test_key() -> &'static RsaPrivateKey {
+    /// テスト用の鍵 (種を固定した乱数から作る = いつも同じ鍵。生成は重いので 1 回だけ。1024 bit = テスト専用の大きさ)
+    fn test_key() -> &'static RsaPrivateKey {
         static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-        KEY.get_or_init(|| RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap())
+        KEY.get_or_init(|| {
+            RsaPrivateKey::new(&mut rand::rngs::StdRng::seed_from_u64(747), 1024).unwrap()
+        })
     }
 
     pub(crate) fn pkcs8_pem() -> String {
         test_key().to_pkcs8_pem(LineEnding::LF).unwrap().to_string()
-    }
-
-    fn pkcs1_pem() -> String {
-        test_key().to_pkcs1_pem(LineEnding::LF).unwrap().to_string()
-    }
-
-    fn b64json(part: &str) -> serde_json::Value {
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).unwrap()).unwrap()
     }
 
     #[test]
@@ -103,58 +60,20 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn signs_verifiable_rs256() {
-        let jwt = sign_rs256(test_key(), &claims("c", "s", 5));
-        let parts: Vec<&str> = jwt.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        assert_eq!(
-            b64json(parts[0]),
-            serde_json::json!({"alg": "RS256", "typ": "JWT"})
-        );
-        assert_eq!(
-            b64json(parts[1]),
-            serde_json::json!({"iss": "c", "sub": "s", "iat": 5, "exp": 65})
-        );
-        let sig =
-            Signature::try_from(URL_SAFE_NO_PAD.decode(parts[2]).unwrap().as_slice()).unwrap();
-        let verifier = VerifyingKey::<Sha256>::new(test_key().to_public_key());
-        let input = format!("{}.{}", parts[0], parts[1]);
-        verifier.verify(input.as_bytes(), &sig).unwrap();
-        assert!(verifier.verify(b"other", &sig).is_err());
-    }
+    /// alc-worker-crypto へ切り替える前の実装 (f9f8feb の `jwt::sign_rs256`) が同じ鍵・claim で出した値
+    /// (RS256 = PKCS#1 v1.5 の署名は乱数を使わないので、header・payload・署名とも 1 byte も変わらない)
+    const BEFORE_SWITCH: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.\
+        eyJpc3MiOiJjbGllbnQtNzQ3Iiwic3ViIjoic2EtNzQ3QGV4YW1wbGUiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MH0.\
+        YHiGn06vUSamdxBcIC-85HUulX178PLPAgrfl3VTToMidfO74PA359xLTbHz_JUa8CLgikZ1JZiWvsJ5GLxxejRNbO2Rht1mtlJ2SIxav\
+        UBG81YLx7dKZnyu1uo6sM7CwYTYcbd2HTKZZVb-Qlem_fMyYNFyVPKJEpnCczk9RM0";
 
     #[test]
-    fn reads_pkcs1_and_pkcs8() {
-        assert_eq!(&parse_private_key(&pkcs8_pem()).unwrap(), test_key());
-        assert_eq!(&parse_private_key(&pkcs1_pem()).unwrap(), test_key());
-    }
-
-    #[test]
-    fn reads_escaped_newlines_and_surrounding_space() {
-        for pem in [pkcs8_pem(), pkcs1_pem()] {
-            let escaped = format!("  {}  ", pem.trim().replace('\n', "\\n"));
-            assert!(!escaped.contains('\n'));
-            assert_eq!(&parse_private_key(&escaped).unwrap(), test_key());
+    fn same_jwt_as_before_switch() {
+        let c = claims("client-747", "sa-747@example", 1_700_000_000);
+        let pkcs1 = test_key().to_pkcs1_pem(LineEnding::LF).unwrap().to_string();
+        let escaped = pkcs8_pem().trim().replace('\n', "\\n");
+        for pem in [pkcs8_pem(), pkcs1, escaped] {
+            assert_eq!(sign_rs256(&pem, None, &c).unwrap(), BEFORE_SWITCH);
         }
-    }
-
-    /// 中身の無い偽の PEM (区切りの行は実行時に組み立てる — ソースに鍵の形の文字列を置かない)
-    fn fake_pem(label: &str, body: &str, sep: &str) -> String {
-        let d = "-".repeat(5);
-        format!("{d}BEGIN {label}{d}{sep}{body}{sep}{d}END {label}{d}")
-    }
-
-    #[test]
-    fn rejects_broken_keys() {
-        assert_eq!(parse_private_key(""), Err(KeyError));
-        assert_eq!(
-            parse_private_key(&fake_pem("RSA PRIVATE KEY", "AAAA", "\n")),
-            Err(KeyError)
-        );
-        assert_eq!(
-            parse_private_key(&fake_pem("PRIVATE KEY", "AAAA", "\n")),
-            Err(KeyError)
-        );
     }
 }

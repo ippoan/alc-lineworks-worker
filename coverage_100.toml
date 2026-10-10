@@ -10,11 +10,7 @@
 # lib.rs は mod 宣言だけなので登録しない。
 # worker 本体 (直下の src/、wasm 専用。外への HTTP の実装 src/http.rs を含む) は native で計測できないので対象外。
 
-# client_secret の復号 (rust の ring の暗号文と相互に読めること)・PEM の改行
-[[files]]
-path = "crates/lineworks/src/secret.rs"
-
-# JWT の claim・RS256 の署名・PKCS#1 / PKCS#8 の PEM
+# JWT の claim (復号と RS256 の署名は kit の alc-worker-crypto。そのテストは kit の CI が持つ)
 [[files]]
 path = "crates/lineworks/src/jwt.rs"
 

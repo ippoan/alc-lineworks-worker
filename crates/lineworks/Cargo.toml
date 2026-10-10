@@ -4,17 +4,17 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# 口 (`routes`)・入力の検証 (`body`)・秘密値の復号 (`secret`)・JWT (`jwt`)・LINE WORKS の呼び方と token の cache (`client`)・
+# 口 (`routes`)・入力の検証 (`body`)・JWT の claim (`jwt`)・LINE WORKS の呼び方と token の cache (`client`)・
 # SQL を流す実装 (`pg`)・ログイン状況の集計 (`activity`) を持ち、native でも wasm32-unknown-unknown でもビルドできる
 # (接続も HTTP の実装も持たない。張るのは直下の worker と tests/)。
+# 秘密値の復号と RS256 の署名は alc-worker-crypto (kit) のものを使う。
 [dependencies]
 # 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
 alc-core-wasm = { workspace = true }
+# client_secret の復号 (rust-alc-api の decrypt_secret と同じ AES-256-GCM)・JWT (RS256) の署名。pure Rust で wasm32 に載る
+alc-worker-crypto = { workspace = true }
 alc-worker-db = { workspace = true }
-# client_secret の復号 (rust-alc-api の decrypt_secret と同じ AES-256-GCM)。pure Rust で wasm32 に載る
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 # 監査ログ・掲示板の日時 (時計は使わない。「今」は呼び手から渡す)
 chrono = { version = "0.4", default-features = false, features = ["alloc", "std"] }
 # 監査ログの CSV (rust-alc-api の parse_login_audit_csv と同じ読み方)。pure Rust
@@ -22,19 +22,11 @@ csv = "1"
 # 監査ログの CSV が UTF-8 でないときの Shift_JIS (rust の decode_csv_bytes と同じ)
 encoding_rs = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# JWT (RS256) の署名。PKCS#1 / PKCS#8 の PEM を読む (署名は乱数を使わない形。wasm32 に載る)
-rsa = { version = "0.9", default-features = false, features = ["std", "pem", "u64_digit"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = { version = "0.10", default-features = false, features = ["oid"] }
 # 型付きの文の型 (`Type`)。接続は張らない (wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
 tokio-postgres = { version = "0.7", default-features = false, features = ["with-uuid-1"] }
 uuid = { version = "1", features = ["serde"] }
-
-# rsa が引く rand_core → getrandom 0.2 は、wasm32-unknown-unknown では feature `js` (crypto.getRandomValues) が無いと
-# build できない。署名は乱数を使わない形 (`Signer::sign`) なので、実行時に呼ばれることは無い
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
@@ -42,7 +34,9 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] 
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["v4"] }
-# テストで鍵を作る・暗号文を作る (rust-alc-api の encrypt_secret の再現) ための乱数
+# テストで鍵を作る・暗号文の nonce を作るための乱数
 rand = "0.8"
-# rust-alc-api の encrypt_secret / decrypt_secret (ring) をテストに写して、相互に読めることを確かめる
-ring = "0.17"
+# テストの鍵 (PKCS#8 の PEM) を作り、JWT を割って署名を公開鍵で検証する
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "pem", "u64_digit"] }
+sha2 = { version = "0.10", default-features = false, features = ["oid"] }

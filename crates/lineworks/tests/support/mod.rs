@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
+use alc_worker_crypto::secret::encrypt_secret_with_nonce;
 use alc_worker_db::PgClient;
 use axum::body::Body;
 use axum::http::Request;
@@ -22,7 +23,6 @@ use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, Http, HttpError, HttpRequest, HttpResponse, TokenCache};
-use lineworks::secret::encrypt_secret_with_nonce;
 use lineworks::{
     router, SendState, LOGIN_ACTIVITY_PATH, MESSAGES_PATH, SEND_PATH, TOKEN_PATH, USERS_PATH,
 };
