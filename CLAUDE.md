@@ -1,7 +1,7 @@
 # alc-lineworks-worker
 
 LINE WORKS の Worker `alc-lineworks` (Refs ohishi-exp/rust-leave-worker#1)。型は rust-leave-worker・alc-dtako-worker と同じ。
-口は 2 つ: `POST /api/internal/lineworks/send` (rust-alc-api と同じ契約) と `POST /api/internal/lineworks/token` (auth-worker 向けの access token)。
+口は 3 つ: `POST /api/internal/lineworks/send` (rust-alc-api と同じ契約)・`POST /api/internal/lineworks/token` (auth-worker 向けの access token)・`POST /api/internal/lineworks/messages` (notify / trouble の worker 向け。tenant 指定で text / image を user / channel へ)。
 直下 = Worker (wasm 専用)、`crates/lineworks/` = 口・SQL・復号・JWT・LINE WORKS の呼び方。詳細は `README.md`。
 
 ## コマンド
@@ -24,6 +24,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - token の口の scope は `client::ALLOWED_SCOPES` だけ。足すときは auth-worker の使う値を確かめる。
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/lineworks/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 24・send_db 11) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 27・send_db 14) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-dtako-worker と同じ rev)。

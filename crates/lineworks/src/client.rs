@@ -1,10 +1,11 @@
 //! LINE WORKS の API の呼び方 (rust-alc-api の `alc-notify::clients::lineworks` の `issue_token`・`send_text_to_user`・
-//! `send_text_to_channel` と同じ要求)。
+//! `send_text_to_channel`・`send_image_to_user`・`send_image_to_channel` と同じ要求)。
 //!
 //! - token: `POST https://auth.worksmobile.com/oauth2/v2.0/token` に form で `assertion` (JWT)・`grant_type`・`client_id`・
 //!   `client_secret`・`scope` (送信は `bot`。token の口は [`ALLOWED_SCOPES`] のどれか)
 //! - 送信: `POST https://www.worksapis.com/v1.0/bots/{bot_id}/channels/{channel_id}/messages` か
-//!   `…/users/{user_id}/messages` に `{"content":{"type":"text","text":…}}`
+//!   `…/users/{user_id}/messages` に `{"content":{"type":"text","text":…}}` か
+//!   `{"content":{"type":"image","originalContentUrl":…,"previewImageUrl":…}}` (画像は URL 渡し。LINE WORKS が取りに行く)
 //!
 //! access token は isolate の中で (Client ID, Service Account, scope) ごとに、有効期限の [`TOKEN_EXPIRY_MARGIN_SECS`] 秒前まで
 //! 使い回す ([`TokenCache`])。外への HTTP は [`Http`] の trait 越し (worker は `worker::Fetch`、テストは偽物)。
@@ -81,6 +82,17 @@ pub enum Destination {
     User(String),
 }
 
+/// 送る中身
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Content<'a> {
+    Text(&'a str),
+    /// 画像の URL (原寸と preview)
+    Image {
+        original_url: &'a str,
+        preview_url: &'a str,
+    },
+}
+
 /// 送信に使う bot の設定 (client_secret は復号済み)
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -150,8 +162,19 @@ pub fn message_url(endpoints: &Endpoints, bot_id: &str, dest: &Destination) -> S
     }
 }
 
-pub fn message_body(text: &str) -> Vec<u8> {
-    serde_json::json!({ "content": { "type": "text", "text": text } })
+pub fn message_body(content: Content<'_>) -> Vec<u8> {
+    let content = match content {
+        Content::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+        Content::Image {
+            original_url,
+            preview_url,
+        } => serde_json::json!({
+            "type": "image",
+            "originalContentUrl": original_url,
+            "previewImageUrl": preview_url,
+        }),
+    };
+    serde_json::json!({ "content": content })
         .to_string()
         .into_bytes()
 }
@@ -276,13 +299,13 @@ impl Client<'_> {
         Ok((token, expires_at))
     }
 
-    /// テキストを 1 通送る
-    pub async fn send_text(
+    /// 1 通送る
+    pub async fn send(
         &self,
         creds: &Credentials,
         private_key_pem: &str,
         dest: &Destination,
-        text: &str,
+        content: Content<'_>,
     ) -> Result<(), SendError> {
         let (token, _) = self
             .access_token(creds, private_key_pem, SEND_SCOPE)
@@ -293,7 +316,7 @@ impl Client<'_> {
                 url: message_url(self.endpoints, &creds.bot_id, dest),
                 content_type: "application/json",
                 authorization: Some(format!("Bearer {token}")),
-                body: message_body(text),
+                body: message_body(content),
             })
             .await
             .map_err(|_| SendError::Transport("send"))?;
@@ -386,10 +409,24 @@ pub(crate) mod tests {
             message_url(&e, "b1", &Destination::User("u@x".into())),
             "https://www.worksapis.com/v1.0/bots/b1/users/u@x/messages"
         );
-        let body: serde_json::Value = serde_json::from_slice(&message_body("予約 \"1\"")).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&message_body(Content::Text("予約 \"1\""))).unwrap();
         assert_eq!(
             body,
             serde_json::json!({"content": {"type": "text", "text": "予約 \"1\""}})
+        );
+        let body: serde_json::Value = serde_json::from_slice(&message_body(Content::Image {
+            original_url: "https://img.test/a.png",
+            preview_url: "https://img.test/a_s.png",
+        }))
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"content": {
+                "type": "image",
+                "originalContentUrl": "https://img.test/a.png",
+                "previewImageUrl": "https://img.test/a_s.png",
+            }})
         );
     }
 
@@ -477,12 +514,22 @@ pub(crate) mod tests {
             cache: &cache,
             now: 1_000,
         };
-        c.send_text(&creds(), &pem, &Destination::Channel("ch-1".into()), "hi")
-            .await
-            .unwrap();
-        c.send_text(&creds(), &pem, &Destination::User("u1".into()), "yo")
-            .await
-            .unwrap();
+        c.send(
+            &creds(),
+            &pem,
+            &Destination::Channel("ch-1".into()),
+            Content::Text("hi"),
+        )
+        .await
+        .unwrap();
+        c.send(
+            &creds(),
+            &pem,
+            &Destination::User("u1".into()),
+            Content::Text("yo"),
+        )
+        .await
+        .unwrap();
         let seen = http.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 3, "token は 1 回だけ");
         assert_eq!(seen[0].url, "https://lw.test/token");
@@ -543,15 +590,27 @@ pub(crate) mod tests {
             cache: &cache,
             now,
         };
-        at(0).send_text(&creds(), &pem, &dest, "a").await.unwrap();
+        at(0)
+            .send(&creds(), &pem, &dest, Content::Text("a"))
+            .await
+            .unwrap();
         // 期限 120 − 余裕 60 = 60 秒より前は使い回す
-        at(59).send_text(&creds(), &pem, &dest, "a").await.unwrap();
+        at(59)
+            .send(&creds(), &pem, &dest, Content::Text("a"))
+            .await
+            .unwrap();
         tokens(1);
-        at(60).send_text(&creds(), &pem, &dest, "a").await.unwrap();
+        at(60)
+            .send(&creds(), &pem, &dest, Content::Text("a"))
+            .await
+            .unwrap();
         tokens(2);
         let mut other = creds();
         other.service_account = "sa2@example".into();
-        at(61).send_text(&other, &pem, &dest, "a").await.unwrap();
+        at(61)
+            .send(&other, &pem, &dest, Content::Text("a"))
+            .await
+            .unwrap();
         tokens(3);
         assert_eq!(cache.len(), 2);
         // scope ごとに別の token。期限は取得した時刻 + expires_in で、cache から返すときも同じ値
@@ -586,7 +645,12 @@ pub(crate) mod tests {
             now: 0,
         };
         let r = c
-            .send_text(&creds(), &pem, &Destination::Channel("c".into()), "x")
+            .send(
+                &creds(),
+                &pem,
+                &Destination::Channel("c".into()),
+                Content::Text("x"),
+            )
             .await;
         (r, cache.len())
     }

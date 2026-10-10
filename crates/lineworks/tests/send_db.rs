@@ -1,4 +1,4 @@
-//! 2 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
+//! 3 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
 //! 接続先は `LINEWORKS_TEST_ADMIN_DATABASE_URL` (無ければ失敗する。tests/support)。
 
 mod support;
@@ -681,6 +681,212 @@ async fn token_errors() {
             serde_json::json!({"error": "upstream_error", "message": "Token issue failed: HTTP 400"})
         )
     );
+}
+
+/// messages の口: text / image × user / channel の 4 通り。bot_config_id が無ければ tenant の有効な lineworks の bot の
+/// うち名前の順で最初 (無効・provider が line・別 tenant の bot は選ばない)、在ればその行 (無効な bot でも送る)。
+/// 応答は 204 で本文なし。LINE WORKS への要求の URL と本文、token が bot ごとに 1 回であることまで見る
+#[tokio::test]
+async fn messages_text_and_image_to_user_and_channel() {
+    let t = tenant().await;
+    let other = tenant().await;
+    bot(other, "0-other-tenant", "lineworks", true).await;
+    bot(t, "1-disabled", "lineworks", false).await;
+    bot(t, "2-line", "line", true).await;
+    let first = bot(t, "3-first", "lineworks", true).await;
+    let second = bot(t, "4-second", "lineworks", false).await;
+    let app = app(Opts::default()).await;
+    let tid = t.to_string();
+    let text = serde_json::json!({"type": "text", "text": "点検の結果です"});
+    let image = serde_json::json!({
+        "type": "image",
+        "original_url": "https://img.test/a.png",
+        "preview_url": "https://img.test/a_s.png",
+    });
+    let cases = [
+        (None, serde_json::json!({"user_id": "u@example"}), &text),
+        (
+            Some(second.id),
+            serde_json::json!({"channel_id": "ch-9"}),
+            &image,
+        ),
+        (None, serde_json::json!({"channel_id": "ch-1"}), &text),
+        (
+            Some(second.id),
+            serde_json::json!({"user_id": "u2"}),
+            &image,
+        ),
+    ];
+    for (bot_config_id, to, content) in &cases {
+        let mut body = serde_json::json!({"to": to, "content": content});
+        if let Some(id) = bot_config_id {
+            body["bot_config_id"] = serde_json::json!(id);
+        }
+        let got = messages(&app, Some(&tid), body).await;
+        assert_eq!((got.status, got.body.len()), (204, 0));
+    }
+
+    let seen = app.http.seen.lock().unwrap().clone();
+    let sends: Vec<_> = seen.iter().filter(|r| r.url != TOKEN_URL).collect();
+    let tokens: Vec<_> = seen.iter().filter(|r| r.url == TOKEN_URL).collect();
+    assert_eq!(tokens.len(), 2, "bot ごとに token 1 回");
+    assert_eq!(form_value(&tokens[0].body, "client_id"), first.client_id);
+    assert_eq!(
+        form_value(&tokens[0].body, "client_secret"),
+        "secret-3-first"
+    );
+    assert_eq!(form_value(&tokens[1].body, "client_id"), second.client_id);
+    let text_body = serde_json::json!({"content": {"type": "text", "text": "点検の結果です"}});
+    let image_body = serde_json::json!({"content": {
+        "type": "image",
+        "originalContentUrl": "https://img.test/a.png",
+        "previewImageUrl": "https://img.test/a_s.png",
+    }});
+    let want = [
+        (
+            format!("{BOTS_URL}{}/users/u@example/messages", first.bot_id),
+            &text_body,
+        ),
+        (
+            format!("{BOTS_URL}{}/channels/ch-9/messages", second.bot_id),
+            &image_body,
+        ),
+        (
+            format!("{BOTS_URL}{}/channels/ch-1/messages", first.bot_id),
+            &text_body,
+        ),
+        (
+            format!("{BOTS_URL}{}/users/u2/messages", second.bot_id),
+            &image_body,
+        ),
+    ];
+    assert_eq!(sends.len(), 4);
+    for (req, (url, body)) in sends.iter().zip(want.iter()) {
+        assert_eq!(&req.url, url);
+        assert_eq!(req.content_type, "application/json");
+        assert_eq!(req.authorization.as_deref(), Some("Bearer tok-1"));
+        let got: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(&got, *body);
+    }
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// messages の口の誤り: tenant のヘッダー (401)・別 tenant / 無い bot と既定の bot が無い tenant (404)・
+/// 入力 (400 / 422)・上流 (502。本文は載せない)。LINE WORKS へは上流の場合だけ届く
+#[tokio::test]
+async fn messages_errors() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let empty = tenant().await;
+    bot(empty, "line-only", "line", true).await;
+    bot(t, "main", "lineworks", true).await;
+    let foreign = bot(other, "foreign", "lineworks", true).await;
+    let app = app(Opts::default()).await;
+    let ok =
+        serde_json::json!({"to": {"user_id": "u1"}, "content": {"type": "text", "text": "本文"}});
+
+    // tenant のヘッダーが無い・UUID でない → 401 (token の口と同じ layer)
+    for tenant in [None, Some("x")] {
+        assert_eq!(messages(&app, tenant, ok.clone()).await.status, 401);
+    }
+    // 別 tenant の bot (RLS + WHERE tenant_id で見えない)・無い bot・既定の bot が無い tenant → 404
+    let mut foreign_body = ok.clone();
+    foreign_body["bot_config_id"] = serde_json::json!(foreign.id);
+    let mut missing_body = ok.clone();
+    missing_body["bot_config_id"] = serde_json::json!(Uuid::new_v4());
+    for (tenant, body) in [(t, foreign_body), (t, missing_body), (empty, ok.clone())] {
+        let got = messages(&app, Some(&tenant.to_string()), body).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (404, serde_json::json!({"error": "bot_config_not_found"}))
+        );
+    }
+    // 入力の誤り (DB を引く前に止まる)
+    let tid = t.to_string();
+    let cases = [
+        (
+            serde_json::json!({"to": {"user_id": "a/b"}, "content": {"type": "text", "text": "x"}}),
+            serde_json::json!({"error": "target_invalid", "message": "to has an invalid id"}),
+        ),
+        (
+            serde_json::json!({"to": {"channel_id": ""}, "content": {"type": "text", "text": "x"}}),
+            serde_json::json!({"error": "target_invalid", "message": "to has an invalid id"}),
+        ),
+        (
+            serde_json::json!({"to": {"user_id": "u"}, "content": {"type": "text", "text": " "}}),
+            serde_json::json!({"error": "text_required", "message": "text is empty"}),
+        ),
+        (
+            serde_json::json!({"to": {"user_id": "u"}, "content": {"type": "image", "original_url": "http://a/1", "preview_url": "https://a/2"}}),
+            serde_json::json!({"error": "image_url_invalid", "message": "original_url and preview_url must be https URLs"}),
+        ),
+    ];
+    for (body, want) in cases {
+        let got = messages(&app, Some(&tid), body).await;
+        assert_eq!((got.status, got.json()), (400, want));
+    }
+    for body in [
+        serde_json::json!({"to": {"user_id": "u", "channel_id": "c"}, "content": {"type": "text", "text": "x"}}),
+        serde_json::json!({"to": {"user_id": "u"}, "content": {"type": "file"}}),
+        serde_json::json!({"to": {"user_id": "u"}, "content": {"type": "text", "text": "x"}, "bot_config_id": "x"}),
+    ] {
+        assert_eq!(messages(&app, Some(&tid), body).await.status, 422);
+    }
+    assert!(app.http.seen.lock().unwrap().is_empty());
+
+    // 上流の失敗 → 502 (status と code だけ。応答の本文・宛先・本文はログにも出さない)
+    let app = app_with(Opts {
+        http: FakeLineworks {
+            send_status: 403,
+            send_body: r#"{"code":"FORBIDDEN","description":"u1 secret"}"#.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let got = messages(&app, Some(&tid), ok).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            502,
+            serde_json::json!({"error": "upstream_error", "message": "Send failed: HTTP 403 (FORBIDDEN)"})
+        )
+    );
+    assert_eq!(
+        *app.logs.lock().unwrap(),
+        ["lineworks-send: Send failed: HTTP 403 (FORBIDDEN)"]
+    );
+    assert_logs_clean(&app, &["u1", "本文", &tid, "secret-main"]);
+}
+
+/// messages の口の DB の失敗 (bot_configs を読めないロール) → 500 と固定の語
+#[tokio::test]
+async fn messages_db_failures() {
+    let t = tenant().await;
+    let b = bot(t, "main", "lineworks", true).await;
+    let base =
+        serde_json::json!({"to": {"user_id": "u1"}, "content": {"type": "text", "text": "x"}});
+    let mut by_id = base.clone();
+    by_id["bot_config_id"] = serde_json::json!(b.id);
+    for (body, want) in [
+        (by_id, "get_bot_config_failed"),
+        (base, "list_bot_configs_failed"),
+    ] {
+        let app = build(client_as(NO_BOT_ROLE).await, Opts::default());
+        let got = messages(&app, Some(&t.to_string()), body).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (
+                500,
+                serde_json::json!({"error": "internal_error", "message": want})
+            )
+        );
+        assert_eq!(
+            *app.logs.lock().unwrap(),
+            ["lineworks-send: bot config failed: db (42501)"]
+        );
+        assert!(app.http.seen.lock().unwrap().is_empty());
+    }
 }
 
 async fn app_with(opts: Opts) -> App {

@@ -2,7 +2,7 @@
 //! `POST /api/internal/lineworks/token` (Refs ohishi-exp/rust-leave-worker#1)。
 //! 送信の口は rust-alc-api の同じ口と同じ契約で、送信を Cloud Run から Worker へ移す。
 //!
-//! - [`routes`] — 口と入力の検証・応答の語
+//! - [`routes`] — 口と入力の検証・応答の語 (tenant 指定で LINE WORKS の id へ直接送る `POST /api/internal/lineworks/messages` も)
 //! - [`pg`] — SQL (宛先の行 id → tenant → bot_configs)
 //! - [`secret`] — client_secret の復号 (rust と同じ AES-256-GCM)
 //! - [`jwt`] — Service Account 認証の JWT (RS256。Private Key は Secrets Store の 1 か所)
@@ -14,4 +14,4 @@ pub mod pg;
 pub mod routes;
 pub mod secret;
 
-pub use routes::{router, LogSink, Now, SendState, SEND_PATH, TOKEN_PATH};
+pub use routes::{router, LogSink, Now, SendState, MESSAGES_PATH, SEND_PATH, TOKEN_PATH};
