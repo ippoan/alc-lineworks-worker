@@ -5,7 +5,7 @@
 //! **この Worker は呼び手を認証しない。** 本番・staging とも workers.dev を開けず (`workers_dev` / `preview_urls` = false、
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
-//! 秘密値は Secrets Store から、3 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
+//! 秘密値は Secrets Store から、5 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
 //! `LINEWORKS_PRIVATE_KEY` (JWT の署名。全 bot で共有する 1 本)。LINE WORKS の access token は isolate の中で使い回す。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
@@ -21,8 +21,12 @@ use std::sync::{Arc, OnceLock};
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
+use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, TokenCache};
-use lineworks::{router, LogSink, SendState, MESSAGES_PATH, SEND_PATH, TOKEN_PATH};
+use lineworks::{
+    router, LogSink, SendState, LOGIN_ACTIVITY_PATH, MESSAGES_PATH, SEND_PATH, TOKEN_PATH,
+    USERS_PATH,
+};
 use tower_service::Service;
 use worker::{
     console_error, event, Context, Date, Env, HttpRequest, Result, WorkerVersionMetadata,
@@ -40,6 +44,21 @@ fn token_cache() -> Arc<TokenCache> {
     static CACHE: OnceLock<Arc<TokenCache>> = OnceLock::new();
     CACHE.get_or_init(Arc::default).clone()
 }
+
+/// isolate の中のログイン状況の合成の置き場 (監査ログの API を同じ isolate の中で並行に呼ばない・5 分使い回す)
+fn activity_cache() -> Arc<ActivityCache> {
+    static CACHE: OnceLock<Arc<ActivityCache>> = OnceLock::new();
+    CACHE.get_or_init(Arc::default).clone()
+}
+
+/// 秘密値を引く口 (ほかの path では Secrets Store を読まない)
+const SECRET_PATHS: [&str; 5] = [
+    SEND_PATH,
+    TOKEN_PATH,
+    MESSAGES_PATH,
+    USERS_PATH,
+    LOGIN_ACTIVITY_PATH,
+];
 
 /// 今の UNIX 秒 (JS の Date)
 fn now_secs() -> u64 {
@@ -89,8 +108,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         }
     };
     let path = req.uri().path();
-    let (sso_key, private_key) = if path == SEND_PATH || path == TOKEN_PATH || path == MESSAGES_PATH
-    {
+    let (sso_key, private_key) = if SECRET_PATHS.contains(&path) {
         (
             secret(&env, SSO_ENCRYPTION_KEY_BINDING).await,
             secret(&env, LINEWORKS_PRIVATE_KEY_BINDING).await,
@@ -103,6 +121,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         http: Arc::new(WorkerHttp),
         endpoints: Arc::new(Endpoints::default()),
         cache: token_cache(),
+        activity: activity_cache(),
         now: Arc::new(now_secs),
         sso_key,
         private_key,

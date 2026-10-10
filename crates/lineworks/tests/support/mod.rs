@@ -20,9 +20,12 @@ use axum::http::Request;
 use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
+use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, Http, HttpError, HttpRequest, HttpResponse, TokenCache};
 use lineworks::secret::encrypt_secret_with_nonce;
-use lineworks::{router, SendState, MESSAGES_PATH, SEND_PATH, TOKEN_PATH};
+use lineworks::{
+    router, SendState, LOGIN_ACTIVITY_PATH, MESSAGES_PATH, SEND_PATH, TOKEN_PATH, USERS_PATH,
+};
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
 use tokio::sync::OnceCell;
@@ -315,7 +318,7 @@ pub async fn recipient(tenant_id: Uuid, provider: &str, enabled: bool) -> (Uuid,
     (id, user)
 }
 
-/// 偽の LINE WORKS (token の口と送信の口)。受けた要求を記録する
+/// 偽の LINE WORKS (token の口と送信の口と GET)。受けた要求を記録する
 pub struct FakeLineworks {
     pub token_status: u16,
     pub token_body: String,
@@ -324,6 +327,48 @@ pub struct FakeLineworks {
     /// true なら届かない
     pub unreachable: bool,
     pub seen: StdMutex<Vec<HttpRequest>>,
+    /// GET の応答 (URL の頭, status, 本文, Location)。上から順に見て、無ければ届かない
+    pub gets: Vec<(String, u16, Vec<u8>, Option<String>)>,
+    /// 受けた GET の (URL, Authorization)
+    pub seen_gets: StdMutex<Vec<(String, String)>>,
+}
+
+impl FakeLineworks {
+    pub fn on_get(mut self, url: &str, status: u16, body: &str, location: Option<&str>) -> Self {
+        self.gets.push((
+            url.to_owned(),
+            status,
+            body.as_bytes().to_vec(),
+            location.map(str::to_owned),
+        ));
+        self
+    }
+
+    pub fn get_urls(&self) -> Vec<String> {
+        self.seen_gets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect()
+    }
+
+    /// token を取った scope (順に)
+    pub fn token_scopes(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.url == TOKEN_URL)
+            .map(|r| {
+                String::from_utf8(r.body.clone())
+                    .unwrap()
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("scope=").map(str::to_owned))
+                    .unwrap()
+            })
+            .collect()
+    }
 }
 
 impl Default for FakeLineworks {
@@ -336,12 +381,17 @@ impl Default for FakeLineworks {
             send_body: String::new(),
             unreachable: false,
             seen: StdMutex::default(),
+            gets: Vec::new(),
+            seen_gets: StdMutex::default(),
         }
     }
 }
 
 pub const TOKEN_URL: &str = "https://lw.test/token";
 pub const BOTS_URL: &str = "https://lw.test/bots/";
+pub const USERS_URL: &str = "https://lw.test/users";
+pub const AUDIT_URL: &str = "https://lw.test/audit";
+pub const BOARDS_URL: &str = "https://lw.test/boards";
 
 impl Http for FakeLineworks {
     fn post(&self, req: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, HttpError>> {
@@ -355,12 +405,38 @@ impl Http for FakeLineworks {
                 HttpResponse {
                     status: self.token_status,
                     body: self.token_body.clone().into_bytes(),
+                    location: None,
                 }
             } else {
                 HttpResponse {
                     status: self.send_status,
                     body: self.send_body.clone().into_bytes(),
+                    location: None,
                 }
+            })
+        })
+    }
+
+    fn get(
+        &self,
+        url: String,
+        authorization: String,
+    ) -> BoxFuture<'_, Result<HttpResponse, HttpError>> {
+        Box::pin(async move {
+            let hit = self
+                .gets
+                .iter()
+                .find(|(u, _, _, _)| url.starts_with(u))
+                .cloned();
+            self.seen_gets.lock().unwrap().push((url, authorization));
+            if self.unreachable {
+                return Err(HttpError);
+            }
+            let (_, status, body, location) = hit.ok_or(HttpError)?;
+            Ok(HttpResponse {
+                status,
+                body,
+                location,
             })
         })
     }
@@ -370,6 +446,7 @@ pub struct App {
     pub router: Router,
     pub http: Arc<FakeLineworks>,
     pub cache: Arc<TokenCache>,
+    pub activity: Arc<ActivityCache>,
     pub logs: Arc<StdMutex<Vec<String>>>,
 }
 
@@ -378,6 +455,9 @@ pub struct Opts {
     pub private_key: Option<String>,
     pub http: FakeLineworks,
     pub cache: Arc<TokenCache>,
+    pub activity: Arc<ActivityCache>,
+    /// テストの「今」(UNIX 秒)
+    pub now: u64,
 }
 
 impl Default for Opts {
@@ -387,12 +467,15 @@ impl Default for Opts {
             private_key: Some(private_key_pem().to_owned()),
             http: FakeLineworks::default(),
             cache: Arc::default(),
+            activity: Arc::default(),
+            now: NOW,
         }
     }
 }
 
 /// worker の src/lib.rs と同じ組み立て
 pub fn build(pg: PgClient, opts: Opts) -> App {
+    let now = opts.now;
     let http = Arc::new(opts.http);
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
@@ -402,9 +485,13 @@ pub fn build(pg: PgClient, opts: Opts) -> App {
         endpoints: Arc::new(Endpoints {
             token: TOKEN_URL.into(),
             bots: BOTS_URL.into(),
+            users: USERS_URL.into(),
+            audit_download: AUDIT_URL.into(),
+            boards: BOARDS_URL.into(),
         }),
         cache: opts.cache.clone(),
-        now: Arc::new(|| NOW),
+        activity: opts.activity.clone(),
+        now: Arc::new(move || now),
         sso_key: opts.sso_key.map(Arc::from),
         private_key: opts.private_key.map(Arc::from),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
@@ -413,6 +500,7 @@ pub fn build(pg: PgClient, opts: Opts) -> App {
         router: router().with_state(state),
         http,
         cache: opts.cache,
+        activity: opts.activity,
         logs,
     }
 }
@@ -488,4 +576,22 @@ pub async fn token(app: &App, tenant: Uuid, body: serde_json::Value) -> Got {
         serde_json::to_vec(&body).unwrap(),
     )
     .await
+}
+
+/// GET の口を打つ (`tenant` が在れば `X-Tenant-ID` を付ける。`query` は `?` の後ろ)
+pub async fn get_path(app: &App, path: &str, tenant: Option<&str>, query: &str) -> Got {
+    let uri = if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    };
+    call_with(app, "GET", &uri, tenant, Vec::new()).await
+}
+
+pub async fn users(app: &App, tenant: Option<&str>, query: &str) -> Got {
+    get_path(app, USERS_PATH, tenant, query).await
+}
+
+pub async fn login_activity(app: &App, tenant: Option<&str>, query: &str) -> Got {
+    get_path(app, LOGIN_ACTIVITY_PATH, tenant, query).await
 }

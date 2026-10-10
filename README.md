@@ -80,16 +80,47 @@ auth-worker の alc-internal-proxy の allowlist には載せない。
 | 400・415・422 | axum の既定 | body が読めない (`to` に両方のキー・未知の `content.type` 等) |
 | 500・502 | 送信の口と同じ | DB・鍵 (`get_bot_config_failed`・`list_bot_configs_failed` ほか) / LINE WORKS の失敗 (本文は載せない) |
 
+### `GET /api/internal/lineworks/users[?bot_config_id=]`
+
+組織のメンバーの一覧 (Refs ippoan/rust-alc-api#747。rust の `alc-notify::clients::lineworks::list_org_users` の移植)。notify の
+`GET /notify/lineworks/users` と trouble の `GET /trouble/lineworks/members` を担う worker が Service Binding で呼ぶ
+(alc-internal-proxy には載せない)。tenant と bot の選び方は messages の口と同じ。
+
+- `GET https://www.worksapis.com/v1.0/users` を scope `directory.read` で、`responseMetaData.nextCursor` が無くなるまで (cursor は符号化して query へ)
+- 200: `[{"user_id": "…", "user_name": "姓 名" | null, "email": "…" | null}]` (rust の `LineworksMember`。notify の `already_registered` は呼び手が足す)
+
+### `GET /api/internal/lineworks/login-activity?days=N[&bot_config_id=]`
+
+ログイン状況 (rust の `alc-notify::lineworks_login_activity` の計算全体。集計は `crates/lineworks/src/activity.rs`)。tenant と bot は users の口と同じ。
+
+- 3 つの信号の一番新しい値: `service=auth` の監査ログ (必須)・`service=message` の監査ログ (best-effort)・掲示板の既読 (投稿の作成日時を下限に。
+  掲示板 5 つ・掲示板ごとに投稿 10 件まで。best-effort)。監査ログの窓は now − 30 日 〜 now (31 日ちょうどは LINE WORKS が断る)
+- 監査ログのダウンロードは別ホストへの 302。`redirect: "manual"` で受けて `Location` (https だけ) へ `Authorization` を付け直す (5 回まで)
+- scope は `directory.read`・`audit.read`・`board.read` を worker の中で取る (token の cache のキーは scope ごと)。**token の口の
+  `ALLOWED_SCOPES` には `audit.read` を足さない**
+- `days` は既定 3 (負は 0)。`stale` = 記録なし か `days_since_login >= days`。並びは記録なしが先頭、その次はログインが古い順
+- 200: `[{"user_id", "user_name", "email", "last_login_at" (RFC3339 | null), "days_since_login" (| null), "stale", "last_login_source" ("auth" | "message" | "board" | null)}]`
+- 合成の結果は isolate の中で (tenant, Client ID) ごとに 300 秒使い回す。取る間は lock を握る (監査ログの API を同じ isolate の中で並行に呼ばない)
+
+| status (users・login-activity) | 本文 | いつ |
+|---|---|---|
+| 200 | 上の配列 | 取れた |
+| 400 | axum の既定 | query が読めない (`bot_config_id` が UUID でない・`days` が数でない) |
+| 401 / 404 / 500 | messages の口と同じ | `X-Tenant-ID` / bot が無い / DB・鍵 |
+| 403 | `{"error":"missing_scope","scope":"directory.read" \| "audit.read","message":"LINE WORKS Developer Console で … scope を追加してください"}` | LINE WORKS が権限で断った (rust と同じ形) |
+| 502 | `{"error":"upstream_error","message":"Read users failed: HTTP 500"}` など | LINE WORKS の失敗 (本文は載せない) |
+| 502 | `{"error":"csv_columns_not_recognized","message":"member/email column not found"}` | auth の監査ログの見出しが読めない (rust と違い、見出しの中身は載せない) |
+
 ### access token の cache
 
-isolate の中で (Client ID, Service Account, scope) ごとに、有効期限の 60 秒前まで使い回す (3 つの口で共有)。
+isolate の中で (Client ID, Service Account, scope) ごとに、有効期限の 60 秒前まで使い回す (5 つの口で共有)。
 
 ## 配置
 
 | 場所 | 中身 |
 |---|---|
-| 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (wasm32 専用)。`src/lib.rs` (載せ方・Secrets Store の読み出し・token の cache)・`src/db.rs` (DB への経路)・`src/http.rs` (`worker::Fetch`)・`src/tcp.rs` (VPC の binding) |
-| `crates/lineworks/` | `routes` (3 つの口)・`pg` (SQL)・`secret` (復号)・`jwt` (RS256・PKCS#1 / PKCS#8)・`client` (URL・form・token・送信・cache。HTTP は trait 越し) |
+| 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (wasm32 専用)。`src/lib.rs` (載せ方・Secrets Store の読み出し・token とログイン状況の cache)・`src/db.rs` (DB への経路)・`src/http.rs` (`worker::Fetch`。GET は `redirect: "manual"`)・`src/tcp.rs` (VPC の binding) |
+| `crates/lineworks/` | `routes` (5 つの口)・`pg` (SQL)・`secret` (復号)・`jwt` (RS256・PKCS#1 / PKCS#8)・`client` (URL・form・token・送信・読み取り・cache。HTTP は trait 越し)・`activity` (ログイン状況の集計) |
 | `scripts/` | 公開範囲の検査と陰性対照・`fetch-migrations.sh` (版は `ALC_MIGRATIONS_REV`)・coverage の gate (登録簿は `coverage_100.toml`) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (PR = dry-run・main = staging・タグ `v*` = 本番) / `tag-release.yml` (手動のタグ) |
 
@@ -118,9 +149,10 @@ bash scripts/check_coverage_100.sh --use-cache cov.txt
 worker-build --release
 ```
 
-- 単体テスト (28 本): 復号 (rust の ring の暗号文を読み、ここの暗号文を rust が読む・固定の値)・PEM の 2 形式と `\n`・JWT の claim と署名の検証・
-  URL と form・token の cache (期限・Service Account・scope ごと)・エラーの文・入力の検証と応答の語
-- 実 DB (tests/send_db.rs、15 本。接続は実行用ロール `alc_api_rt`): 3 つの口を偽の LINE WORKS で端から端まで。lookup の関数の所有者の条件
+- 単体テスト (47 本): 復号 (rust の ring の暗号文を読み、ここの暗号文を rust が読む・固定の値)・PEM の 2 形式と `\n`・JWT の claim と署名の検証・
+  URL と form・token の cache (期限・Service Account・scope ごと)・エラーの文・入力の検証と応答の語・users の全ページ・
+  リダイレクトの手での追従と失敗・掲示板の上限・監査ログの CSV (rust の単体テストの期待値)・3 つの信号の合成・しきい値と並び
+- 実 DB (tests/send_db.rs、19 本。接続は実行用ロール `alc_api_rt`): 5 つの口を偽の LINE WORKS で端から端まで。lookup の関数の所有者の条件
   (`lookup_owner_condition`: テストの DB は superuser が所有者で両方引ける。所有者を RLS の掛かるロールにすると FORCE RLS の
   `lineworks_channels` は 0 行・`notify_recipients` は 1 行) も確かめる
 - 実 DB のテストは `LINEWORKS_TEST_ADMIN_DATABASE_URL` が無ければ失敗する (skip しない)

@@ -1,4 +1,4 @@
-//! 口は 3 つ。どれも認証は持たない (入口は auth-worker からの Service Binding だけ。wrangler.toml と scripts/check-exposure.sh)。
+//! 口は 5 つ。どれも認証は持たない (入口は auth-worker からの Service Binding だけ。wrangler.toml と scripts/check-exposure.sh)。
 //!
 //! ## `POST /api/internal/lineworks/send` (rust-alc-api の `alc-notify::lineworks_channels::send_text_internal` と同じ契約)
 //!
@@ -30,6 +30,24 @@
 //!   どちらも無ければ 404 `bot_config_not_found` (別 tenant の id も RLS と `WHERE tenant_id` で見えず 404)
 //! - 応答: 成功は 204 (本文なし)。失敗の語は送信の口と同じ (502 の `message` は status と LINE WORKS のエラーの code まで)
 //!
+//! ## `GET /api/internal/lineworks/users[?bot_config_id=]` (Refs ippoan/rust-alc-api#747)
+//!
+//! 組織のメンバーの一覧 (rust の `alc-notify::clients::lineworks::list_org_users`。scope `directory.read`、cursor で全ページ)。
+//! notify の `GET /notify/lineworks/users` と trouble の `GET /trouble/lineworks/members` が呼ぶ (Service Binding 専用)。
+//! - tenant と bot は messages の口と同じ (`X-Tenant-ID`・`bot_config_id` が無ければ既定の bot・無ければ 404)
+//! - 応答: 200 `[{"user_id": "…", "user_name": "姓 名" | null, "email": "…" | null}]` (rust の `LineworksMember`)
+//! - LINE WORKS が権限で断った (403) → 403 `{"error": "missing_scope", "scope": "directory.read", "message": …}`
+//!   (rust の notify の口と同じ)。ほかの失敗は 502 `upstream_error`
+//!
+//! ## `GET /api/internal/lineworks/login-activity?days=N[&bot_config_id=]` (Refs ippoan/rust-alc-api#747)
+//!
+//! ログイン状況 (rust の `alc-notify::lineworks_login_activity::get_login_activity` の計算全体。集計は [`crate::activity`])。
+//! - `days` は既定 3 (負は 0)。tenant と bot は users の口と同じ
+//! - 応答: 200 で 1 人 1 行の配列 (rust と同じ JSON・並び)
+//! - メンバーの一覧の失敗は users の口と同じ (`missing_scope` の scope は `directory.read`)。auth の監査ログの失敗は
+//!   403 `missing_scope` (`audit.read`) / 502 `upstream_error`、CSV の見出しが読めない → 502 `csv_columns_not_recognized`
+//!   (`message` は固定の語。rust と違い見出しの中身は載せない)。message の監査ログと掲示板は best-effort
+//!
 //! ログに出すのは固定の語・段の名前・DB のエラーの kind・HTTP の status まで (行 id・本文・token・secret を出さない)。
 
 use std::sync::Arc;
@@ -37,17 +55,18 @@ use std::sync::Arc;
 use alc_core_wasm::api_error::{bad_request, internal_error_msg, not_found, ApiError};
 use alc_core_wasm::{require_tenant_header, TenantId};
 use alc_worker_db::{kind, PgClient};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{middleware, Extension, Json, Router};
 use futures_util::lock::Mutex;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::activity::{self, ActivityCache, ActivityError, LoginActivityEntry, DEFAULT_DAYS};
 use crate::client::{
-    Client, Content, Credentials, Destination, Endpoints, Http, SendError, TokenCache,
-    ALLOWED_SCOPES,
+    Client, Content, Credentials, Destination, Endpoints, Http, LineworksMember, SendError,
+    TokenCache, ALLOWED_SCOPES, AUDIT_SCOPE, DIRECTORY_SCOPE,
 };
 use crate::pg::{self, BotConfigRow, RecipientRow};
 use crate::secret::decrypt_secret;
@@ -55,6 +74,8 @@ use crate::secret::decrypt_secret;
 pub const SEND_PATH: &str = "/api/internal/lineworks/send";
 pub const TOKEN_PATH: &str = "/api/internal/lineworks/token";
 pub const MESSAGES_PATH: &str = "/api/internal/lineworks/messages";
+pub const USERS_PATH: &str = "/api/internal/lineworks/users";
+pub const LOGIN_ACTIVITY_PATH: &str = "/api/internal/lineworks/login-activity";
 
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub type Now = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -65,6 +86,8 @@ pub struct SendState {
     pub http: Arc<dyn Http>,
     pub endpoints: Arc<Endpoints>,
     pub cache: Arc<TokenCache>,
+    /// ログイン状況の合成の結果 (isolate の中で使い回す)
+    pub activity: Arc<ActivityCache>,
     /// 今の UNIX 秒
     pub now: Now,
     /// `SSO_ENCRYPTION_KEY` (Secrets Store)。取れなければ `None`
@@ -74,11 +97,13 @@ pub struct SendState {
     pub log: LogSink,
 }
 
-/// 送信の口は tenant のヘッダーを見ない。token の口と messages の口にだけ tenant の layer を掛ける
+/// 送信の口は tenant のヘッダーを見ない。ほかの口にだけ tenant の layer を掛ける
 pub fn router() -> Router<SendState> {
     let tenant = Router::new()
         .route(TOKEN_PATH, post(issue_token))
         .route(MESSAGES_PATH, post(send_message))
+        .route(USERS_PATH, get(list_users))
+        .route(LOGIN_ACTIVITY_PATH, get(login_activity))
         .route_layer(middleware::from_fn(require_tenant_header));
     Router::new()
         .route(SEND_PATH, post(send_text))
@@ -137,6 +162,24 @@ pub fn check_bot_selection(target: &Target, bot_config_id: Option<Uuid>) -> Resu
 pub struct TokenBody {
     pub bot_config_id: Uuid,
     pub scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UsersQuery {
+    #[serde(default)]
+    pub bot_config_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginActivityQuery {
+    #[serde(default = "default_days")]
+    pub days: i64,
+    #[serde(default)]
+    pub bot_config_id: Option<Uuid>,
+}
+
+fn default_days() -> i64 {
+    DEFAULT_DAYS
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +304,22 @@ pub fn send_error_response(e: &SendError) -> ApiError {
     }
 }
 
+/// 読み取りの失敗の応答。LINE WORKS が権限で断ったら 403 `missing_scope` (rust の notify の `scope_error` と同じ形)、
+/// ほかは [`send_error_response`]
+pub fn read_error_response(e: &SendError, scope: &str) -> ApiError {
+    if e.is_forbidden() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "missing_scope",
+                "scope": scope,
+                "message": format!("LINE WORKS Developer Console で {scope} scope を追加してください"),
+            })),
+        );
+    }
+    send_error_response(e)
+}
+
 impl SendState {
     fn fail(&self, stage: &str, e: &tokio_postgres::Error, msg: &str) -> ApiError {
         (self.log)(&format!("lineworks-send: {stage} failed: db ({})", kind(e)));
@@ -304,6 +363,29 @@ impl SendState {
     fn upstream(&self, e: SendError) -> ApiError {
         (self.log)(&format!("lineworks-send: {e}"));
         send_error_response(&e)
+    }
+
+    fn read_failed(&self, e: SendError, scope: &str) -> ApiError {
+        (self.log)(&format!("lineworks-read: {e}"));
+        read_error_response(&e, scope)
+    }
+
+    /// tenant の bot (`bot_config_id` があればその行、無ければ既定の bot。どちらも無ければ 404)
+    async fn tenant_bot(
+        &self,
+        tenant_id: Uuid,
+        bot_config_id: Option<Uuid>,
+    ) -> Result<BotConfigRow, ApiError> {
+        let mut pg = self.pg.lock().await;
+        match bot_config_id {
+            Some(id) => pg::bot_config_by_id(&mut pg, tenant_id, id)
+                .await
+                .map_err(|e| self.fail("bot config", &e, "get_bot_config_failed"))?,
+            None => pg::bot_config_for_tenant(&mut pg, tenant_id)
+                .await
+                .map_err(|e| self.fail("bot config", &e, "list_bot_configs_failed"))?,
+        }
+        .ok_or_else(|| not_found("bot_config_not_found"))
     }
 
     async fn deliver(
@@ -379,20 +461,61 @@ async fn send_message(
 ) -> Result<StatusCode, ApiError> {
     let content = content(&body.content)?;
     let dest = destination(body.to)?;
-    let bot = {
-        let mut pg = state.pg.lock().await;
-        match body.bot_config_id {
-            Some(id) => pg::bot_config_by_id(&mut pg, tenant_id, id)
-                .await
-                .map_err(|e| state.fail("bot config", &e, "get_bot_config_failed"))?,
-            None => pg::bot_config_for_tenant(&mut pg, tenant_id)
-                .await
-                .map_err(|e| state.fail("bot config", &e, "list_bot_configs_failed"))?,
-        }
-    }
-    .ok_or_else(|| not_found("bot_config_not_found"))?;
+    let bot = state.tenant_bot(tenant_id, body.bot_config_id).await?;
     state.deliver(bot, dest, content).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_users(
+    State(state): State<SendState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Query(q): Query<UsersQuery>,
+) -> Result<Json<Vec<LineworksMember>>, ApiError> {
+    let bot = state.tenant_bot(tenant_id, q.bot_config_id).await?;
+    let (creds, private_key) = state.credentials(bot)?;
+    let members = state
+        .client()
+        .list_org_users(&creds, &private_key)
+        .await
+        .map_err(|e| state.read_failed(e, DIRECTORY_SCOPE))?;
+    Ok(Json(members))
+}
+
+async fn login_activity(
+    State(state): State<SendState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Query(q): Query<LoginActivityQuery>,
+) -> Result<Json<Vec<LoginActivityEntry>>, ApiError> {
+    let days = q.days.max(0);
+    let bot = state.tenant_bot(tenant_id, q.bot_config_id).await?;
+    let (creds, private_key) = state.credentials(bot)?;
+    let client = state.client();
+    let members = client
+        .list_org_users(&creds, &private_key)
+        .await
+        .map_err(|e| state.read_failed(e, DIRECTORY_SCOPE))?;
+    let combined = activity::get_or_fetch(
+        &state.activity,
+        tenant_id,
+        &client,
+        &creds,
+        &private_key,
+        &members,
+        &*state.log,
+    )
+    .await
+    .map_err(|e| match e {
+        ActivityError::Upstream(e) => state.read_failed(e, AUDIT_SCOPE),
+        ActivityError::Csv(msg) => {
+            (state.log)(&format!("lineworks-read: auth audit csv: {msg}"));
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "csv_columns_not_recognized", "message": msg})),
+            )
+        }
+    })?;
+    let now = activity::to_datetime(client.now);
+    Ok(Json(activity::entries(members, &combined, now, days)))
 }
 
 async fn issue_token(
@@ -649,6 +772,38 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn read_errors() {
+        let forbidden = [
+            SendError::ReadStatus("users", 403, None),
+            SendError::TokenStatus(400, Some("Forbidden".into())),
+            SendError::SendStatus(401, Some("ACCESS_FORBIDDEN".into())),
+        ];
+        for e in forbidden {
+            assert!(e.is_forbidden());
+            assert_eq!(
+                err(read_error_response(&e, "audit.read")),
+                (
+                    403,
+                    serde_json::json!({"error": "missing_scope", "scope": "audit.read", "message": "LINE WORKS Developer Console で audit.read scope を追加してください"})
+                )
+            );
+        }
+        for e in [
+            SendError::ReadStatus("users", 500, Some("SERVER".into())),
+            SendError::Redirect("audit"),
+            SendError::PrivateKey,
+        ] {
+            assert!(!e.is_forbidden());
+            assert_eq!(
+                err(read_error_response(&e, "audit.read")),
+                err(send_error_response(&e))
+            );
+        }
+        let q: LoginActivityQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!((q.days, q.bot_config_id), (3, None));
     }
 
     #[test]

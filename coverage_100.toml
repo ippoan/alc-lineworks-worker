@@ -18,7 +18,7 @@ path = "crates/lineworks/src/secret.rs"
 [[files]]
 path = "crates/lineworks/src/jwt.rs"
 
-# LINE WORKS の URL・form・token の取得と cache・送信・エラーの文
+# LINE WORKS の URL・form・token の取得と cache・送信・読み取り (GET とリダイレクト)・エラーの文
 [[files]]
 path = "crates/lineworks/src/client.rs"
 
@@ -26,6 +26,10 @@ path = "crates/lineworks/src/client.rs"
 [[files]]
 path = "crates/lineworks/src/pg.rs"
 
-# 3 つの口 (400 / 401 / 404 / 405 / 422 / 500 / 502 の本文とログまで)
+# 5 つの口 (400 / 401 / 403 / 404 / 405 / 422 / 500 / 502 の本文とログまで)
 [[files]]
 path = "crates/lineworks/src/routes.rs"
+
+# ログイン状況の集計 (監査ログの CSV・3 つの信号の合成・並び・cache。tests/send_db.rs が口から通す)
+[[files]]
+path = "crates/lineworks/src/activity.rs"
