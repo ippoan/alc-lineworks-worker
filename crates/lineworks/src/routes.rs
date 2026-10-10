@@ -91,6 +91,9 @@ pub struct SendBody {
     pub channel_id: Option<Uuid>,
     #[serde(default)]
     pub recipient_id: Option<Uuid>,
+    /// recipient 宛のときだけ使う bot (`bot_configs.id`)。無ければ tenant の名前順の最初。channel 宛との併用は 400
+    #[serde(default)]
+    pub bot_config_id: Option<Uuid>,
     pub text: String,
 }
 
@@ -116,6 +119,17 @@ pub fn resolve_target(
             "target_required",
             "channel_id or recipient_id is required",
         )),
+    }
+}
+
+/// `bot_config_id` は recipient 宛のときだけ (channel 宛は channel 行の bot で決まる)
+pub fn check_bot_selection(target: &Target, bot_config_id: Option<Uuid>) -> Result<(), ApiError> {
+    match (target, bot_config_id) {
+        (Target::Channel(_), Some(_)) => Err(bad_request(
+            "bot_config_not_allowed",
+            "bot_config_id is only for recipient_id",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -312,6 +326,7 @@ async fn send_text(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_text(&body.text)?;
     let target = resolve_target(body.channel_id, body.recipient_id)?;
+    check_bot_selection(&target, body.bot_config_id)?;
     let (bot, dest) = {
         let mut pg = state.pg.lock().await;
         match target {
@@ -331,9 +346,23 @@ async fn send_text(
                     .map_err(|e| state.fail("lookup recipient", &e, "get_failed"))?
                     .ok_or_else(|| not_found("recipient_not_found"))?;
                 let user_id = lineworks_user_id(&row)?.to_owned();
-                let bot = pg::bot_config_for_tenant(&mut pg, row.tenant_id)
-                    .await
-                    .map_err(|e| state.fail("bot config", &e, "list_bot_configs_failed"))?;
+                let bot = match body.bot_config_id {
+                    // 指定の bot が使えないときは名前順に戻さず送らない (別の bot から届くのを防ぐ)
+                    Some(id) => Some(
+                        pg::lineworks_bot_config_by_id(&mut pg, row.tenant_id, id)
+                            .await
+                            .map_err(|e| state.fail("bot config", &e, "get_bot_config_failed"))?
+                            .ok_or_else(|| {
+                                bad_request(
+                                    "bot_config_unavailable",
+                                    "bot_config_id is not an enabled lineworks bot of the tenant",
+                                )
+                            })?,
+                    ),
+                    None => pg::bot_config_for_tenant(&mut pg, row.tenant_id)
+                        .await
+                        .map_err(|e| state.fail("bot config", &e, "list_bot_configs_failed"))?,
+                };
                 (bot, Destination::User(user_id))
             }
         }
@@ -420,6 +449,26 @@ mod tests {
                 serde_json::json!({"error": "target_required", "message": "channel_id or recipient_id is required"})
             )
         );
+    }
+
+    #[test]
+    fn bot_selection() {
+        let (c, r, b) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        assert!(check_bot_selection(&Target::Channel(c), None).is_ok());
+        assert!(check_bot_selection(&Target::Recipient(r), None).is_ok());
+        assert!(check_bot_selection(&Target::Recipient(r), Some(b)).is_ok());
+        assert_eq!(
+            err(check_bot_selection(&Target::Channel(c), Some(b)).unwrap_err()),
+            (
+                400,
+                serde_json::json!({"error": "bot_config_not_allowed", "message": "bot_config_id is only for recipient_id"})
+            )
+        );
+        let body: SendBody = serde_json::from_value(
+            serde_json::json!({"recipient_id": r, "bot_config_id": b, "text": "hi"}),
+        )
+        .unwrap();
+        assert_eq!(body.bot_config_id, Some(b));
     }
 
     #[test]
