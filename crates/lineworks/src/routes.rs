@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 use alc_core_wasm::api_error::{bad_request, internal_error_msg, not_found, ApiError};
 use alc_core_wasm::{require_tenant_header, TenantId};
+use alc_worker_crypto::secret::decrypt_secret;
 use alc_worker_db::{kind, PgClient};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -69,7 +70,6 @@ use crate::client::{
     TokenCache, ALLOWED_SCOPES, AUDIT_SCOPE, DIRECTORY_SCOPE,
 };
 use crate::pg::{self, BotConfigRow, RecipientRow};
-use crate::secret::decrypt_secret;
 
 pub const SEND_PATH: &str = "/api/internal/lineworks/send";
 pub const TOKEN_PATH: &str = "/api/internal/lineworks/token";

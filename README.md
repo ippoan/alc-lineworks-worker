@@ -120,7 +120,7 @@ isolate の中で (Client ID, Service Account, scope) ごとに、有効期限�
 | 場所 | 中身 |
 |---|---|
 | 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (wasm32 専用)。`src/lib.rs` (載せ方・Secrets Store の読み出し・token とログイン状況の cache)・`src/db.rs` (DB への経路)・`src/http.rs` (`worker::Fetch`。GET は `redirect: "manual"`)・`src/tcp.rs` (VPC の binding) |
-| `crates/lineworks/` | `routes` (5 つの口)・`pg` (SQL)・`secret` (復号)・`jwt` (RS256・PKCS#1 / PKCS#8)・`client` (URL・form・token・送信・読み取り・cache。HTTP は trait 越し)・`activity` (ログイン状況の集計) |
+| `crates/lineworks/` | `routes` (5 つの口)・`pg` (SQL)・`jwt` (LINE WORKS の claim。復号と RS256 の署名は kit の `alc-worker-crypto`)・`client` (URL・form・token・送信・読み取り・cache。HTTP は trait 越し)・`activity` (ログイン状況の集計) |
 | `scripts/` | 公開範囲の検査と陰性対照・`fetch-migrations.sh` (版は `ALC_MIGRATIONS_REV`)・coverage の gate (登録簿は `coverage_100.toml`) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (PR = dry-run・main = staging・タグ `v*` = 本番) / `tag-release.yml` (手動のタグ) |
 

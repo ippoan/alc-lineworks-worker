@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use alc_worker_crypto::jwt::sign_rs256;
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -331,12 +332,13 @@ impl Client<'_> {
         if let Some(hit) = self.cache.get(&key, self.now) {
             return Ok(hit);
         }
-        let private_key =
-            jwt::parse_private_key(private_key_pem).map_err(|_| SendError::PrivateKey)?;
-        let assertion = jwt::sign_rs256(
-            &private_key,
+        // claim は String と u64 だけなので、落ちるのは PEM が読めないときだけ
+        let assertion = sign_rs256(
+            private_key_pem,
+            None,
             &jwt::claims(&creds.client_id, &creds.service_account, self.now),
-        );
+        )
+        .map_err(|_| SendError::PrivateKey)?;
         let form = form_urlencode(&[
             ("assertion", &assertion),
             ("grant_type", GRANT_TYPE),
