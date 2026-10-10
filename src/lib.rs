@@ -5,7 +5,7 @@
 //! **この Worker は呼び手を認証しない。** 本番・staging とも workers.dev を開けず (`workers_dev` / `preview_urls` = false、
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
-//! 秘密値は Secrets Store から、2 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
+//! 秘密値は Secrets Store から、3 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
 //! `LINEWORKS_PRIVATE_KEY` (JWT の署名。全 bot で共有する 1 本)。LINE WORKS の access token は isolate の中で使い回す。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
 use lineworks::client::{Endpoints, TokenCache};
-use lineworks::{router, LogSink, SendState, SEND_PATH, TOKEN_PATH};
+use lineworks::{router, LogSink, SendState, MESSAGES_PATH, SEND_PATH, TOKEN_PATH};
 use tower_service::Service;
 use worker::{
     console_error, event, Context, Date, Env, HttpRequest, Result, WorkerVersionMetadata,
@@ -89,7 +89,8 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         }
     };
     let path = req.uri().path();
-    let (sso_key, private_key) = if path == SEND_PATH || path == TOKEN_PATH {
+    let (sso_key, private_key) = if path == SEND_PATH || path == TOKEN_PATH || path == MESSAGES_PATH
+    {
         (
             secret(&env, SSO_ENCRYPTION_KEY_BINDING).await,
             secret(&env, LINEWORKS_PRIVATE_KEY_BINDING).await,

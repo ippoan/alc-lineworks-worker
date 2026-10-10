@@ -22,7 +22,7 @@ use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use lineworks::client::{Endpoints, Http, HttpError, HttpRequest, HttpResponse, TokenCache};
 use lineworks::secret::encrypt_secret_with_nonce;
-use lineworks::{router, SendState, SEND_PATH, TOKEN_PATH};
+use lineworks::{router, SendState, MESSAGES_PATH, SEND_PATH, TOKEN_PATH};
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
 use tokio::sync::OnceCell;
@@ -464,6 +464,18 @@ pub async fn call_with(
 
 pub async fn send(app: &App, body: serde_json::Value) -> Got {
     call_raw(app, "POST", SEND_PATH, serde_json::to_vec(&body).unwrap()).await
+}
+
+/// messages の口を打つ (`tenant` が在れば `X-Tenant-ID` を付ける)
+pub async fn messages(app: &App, tenant: Option<&str>, body: serde_json::Value) -> Got {
+    call_with(
+        app,
+        "POST",
+        MESSAGES_PATH,
+        tenant,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .await
 }
 
 /// token の口を `tenant` のヘッダー付きで打つ

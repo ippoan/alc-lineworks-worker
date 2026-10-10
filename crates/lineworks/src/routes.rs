@@ -1,4 +1,4 @@
-//! 口は 2 つ。どちらも認証は持たない (入口は auth-worker からの Service Binding だけ。wrangler.toml と scripts/check-exposure.sh)。
+//! 口は 3 つ。どれも認証は持たない (入口は auth-worker からの Service Binding だけ。wrangler.toml と scripts/check-exposure.sh)。
 //!
 //! ## `POST /api/internal/lineworks/send` (rust-alc-api の `alc-notify::lineworks_channels::send_text_internal` と同じ契約)
 //!
@@ -17,6 +17,19 @@
 //! - その tenant の bot_configs の行だけを読む (別 tenant の id は 404 `bot_config_not_found`)
 //! - 応答: 200 `{"access_token": "...", "expires_at": <UNIX 秒>, "bot_id": "..."}`。**Client Secret と Private Key は応答に入れない**
 //!
+//! ## `POST /api/internal/lineworks/messages` (Refs ippoan/rust-alc-api#747)
+//!
+//! notify / trouble の worker が、tenant を指定して LINE WORKS の id へ直接送る (Service Binding 専用。auth-worker の
+//! alc-internal-proxy には出さない)。
+//! - tenant は `X-Tenant-ID` (token の口と同じ layer。無い・UUID でない → 401)
+//! - body: `{"bot_config_id": "<bot_configs.id>"?, "to": {"user_id": "…"} | {"channel_id": "…"},
+//!   "content": {"type": "text", "text": "…"} | {"type": "image", "original_url": "https://…", "preview_url": "https://…"}}`。
+//!   `to` の id は LINE WORKS 側の id (lineworks_channels の行 id ではない)。読めない body は axum の `Json` の既定の拒否
+//! - bot: `bot_config_id` があればその tenant のその行 (provider・enabled は見ない。送信の口の channel 宛と同じ)、
+//!   無ければ tenant の有効な LINE WORKS の bot のうち名前の順で最初 (rust の trouble・notify の `resolve_lineworks_config` と同じ)。
+//!   どちらも無ければ 404 `bot_config_not_found` (別 tenant の id も RLS と `WHERE tenant_id` で見えず 404)
+//! - 応答: 成功は 204 (本文なし)。失敗の語は送信の口と同じ (502 の `message` は status と LINE WORKS のエラーの code まで)
+//!
 //! ログに出すのは固定の語・段の名前・DB のエラーの kind・HTTP の status まで (行 id・本文・token・secret を出さない)。
 
 use std::sync::Arc;
@@ -33,13 +46,15 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::client::{
-    Client, Credentials, Destination, Endpoints, Http, SendError, TokenCache, ALLOWED_SCOPES,
+    Client, Content, Credentials, Destination, Endpoints, Http, SendError, TokenCache,
+    ALLOWED_SCOPES,
 };
 use crate::pg::{self, BotConfigRow, RecipientRow};
 use crate::secret::decrypt_secret;
 
 pub const SEND_PATH: &str = "/api/internal/lineworks/send";
 pub const TOKEN_PATH: &str = "/api/internal/lineworks/token";
+pub const MESSAGES_PATH: &str = "/api/internal/lineworks/messages";
 
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub type Now = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -59,12 +74,15 @@ pub struct SendState {
     pub log: LogSink,
 }
 
-/// 送信の口は tenant のヘッダーを見ない。token の口にだけ tenant の layer を掛ける
+/// 送信の口は tenant のヘッダーを見ない。token の口と messages の口にだけ tenant の layer を掛ける
 pub fn router() -> Router<SendState> {
-    let token = Router::new()
+    let tenant = Router::new()
         .route(TOKEN_PATH, post(issue_token))
+        .route(MESSAGES_PATH, post(send_message))
         .route_layer(middleware::from_fn(require_tenant_header));
-    Router::new().route(SEND_PATH, post(send_text)).merge(token)
+    Router::new()
+        .route(SEND_PATH, post(send_text))
+        .merge(tenant)
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +123,73 @@ pub fn resolve_target(
 pub struct TokenBody {
     pub bot_config_id: Uuid,
     pub scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MessagesBody {
+    #[serde(default)]
+    pub bot_config_id: Option<Uuid>,
+    pub to: To,
+    pub content: MessageContent,
+}
+
+/// 送り先 (LINE WORKS 側の id)。どちらか一方だけ (両方・ほかのキーは読めない body)
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum To {
+    User { user_id: String },
+    Channel { channel_id: String },
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum MessageContent {
+    Text {
+        text: String,
+    },
+    Image {
+        original_url: String,
+        preview_url: String,
+    },
+}
+
+/// LINE WORKS の id は URL の path にそのまま入れるので、空と path を崩す文字 (`/ ? # %`・空白・制御文字) を断る
+pub fn destination(to: To) -> Result<Destination, ApiError> {
+    let (id, dest): (String, fn(String) -> Destination) = match to {
+        To::User { user_id } => (user_id, Destination::User),
+        To::Channel { channel_id } => (channel_id, Destination::Channel),
+    };
+    let bad = |c: char| matches!(c, '/' | '?' | '#' | '%') || c.is_whitespace() || c.is_control();
+    if id.is_empty() || id.chars().any(bad) {
+        return Err(bad_request("target_invalid", "to has an invalid id"));
+    }
+    Ok(dest(id))
+}
+
+/// 中身の検証 (text は空白だけを断る。画像の URL は https だけ)
+pub fn content(c: &MessageContent) -> Result<Content<'_>, ApiError> {
+    match c {
+        MessageContent::Text { text } => {
+            check_text(text)?;
+            Ok(Content::Text(text))
+        }
+        MessageContent::Image {
+            original_url,
+            preview_url,
+        } => {
+            let https = |u: &str| u.len() > "https://".len() && u.starts_with("https://");
+            if !(https(original_url) && https(preview_url)) {
+                return Err(bad_request(
+                    "image_url_invalid",
+                    "original_url and preview_url must be https URLs",
+                ));
+            }
+            Ok(Content::Image {
+                original_url,
+                preview_url,
+            })
+        }
+    }
 }
 
 /// token の口の scope の許可リスト
@@ -211,11 +296,11 @@ impl SendState {
         &self,
         row: BotConfigRow,
         dest: Destination,
-        text: &str,
+        content: Content<'_>,
     ) -> Result<(), ApiError> {
         let (creds, private_key) = self.credentials(row)?;
         self.client()
-            .send_text(&creds, &private_key, &dest, text)
+            .send(&creds, &private_key, &dest, content)
             .await
             .map_err(|e| self.upstream(e))
     }
@@ -254,8 +339,31 @@ async fn send_text(
         }
     };
     let bot = bot.ok_or_else(|| internal_error_msg("bot_config_not_found"))?;
-    state.deliver(bot, dest, &body.text).await?;
+    state.deliver(bot, dest, Content::Text(&body.text)).await?;
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn send_message(
+    State(state): State<SendState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Json(body): Json<MessagesBody>,
+) -> Result<StatusCode, ApiError> {
+    let content = content(&body.content)?;
+    let dest = destination(body.to)?;
+    let bot = {
+        let mut pg = state.pg.lock().await;
+        match body.bot_config_id {
+            Some(id) => pg::bot_config_by_id(&mut pg, tenant_id, id)
+                .await
+                .map_err(|e| state.fail("bot config", &e, "get_bot_config_failed"))?,
+            None => pg::bot_config_for_tenant(&mut pg, tenant_id)
+                .await
+                .map_err(|e| state.fail("bot config", &e, "list_bot_configs_failed"))?,
+        }
+    }
+    .ok_or_else(|| not_found("bot_config_not_found"))?;
+    state.deliver(bot, dest, content).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn issue_token(
@@ -386,6 +494,96 @@ mod tests {
                 serde_json::json!({"error": "recipient_disabled", "message": "recipient is disabled"})
             )
         );
+    }
+
+    #[test]
+    fn destinations() {
+        let user = |s: &str| To::User { user_id: s.into() };
+        let channel = |s: &str| To::Channel {
+            channel_id: s.into(),
+        };
+        assert_eq!(
+            destination(user("u@example")).unwrap(),
+            Destination::User("u@example".into())
+        );
+        assert_eq!(
+            destination(channel("ch-1")).unwrap(),
+            Destination::Channel("ch-1".into())
+        );
+        for bad in ["", "a/b", "a?b", "a#b", "a%2F", "a b", "a\u{1}"] {
+            for to in [user(bad), channel(bad)] {
+                assert_eq!(
+                    err(destination(to).unwrap_err()),
+                    (
+                        400,
+                        serde_json::json!({"error": "target_invalid", "message": "to has an invalid id"})
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contents() {
+        let text = MessageContent::Text { text: "hi".into() };
+        assert_eq!(content(&text).unwrap(), Content::Text("hi"));
+        let blank = MessageContent::Text { text: " ".into() };
+        assert_eq!(
+            err(content(&blank).unwrap_err()),
+            (
+                400,
+                serde_json::json!({"error": "text_required", "message": "text is empty"})
+            )
+        );
+        let image = |o: &str, p: &str| MessageContent::Image {
+            original_url: o.into(),
+            preview_url: p.into(),
+        };
+        assert_eq!(
+            content(&image("https://a/1", "https://a/2")).unwrap(),
+            Content::Image {
+                original_url: "https://a/1",
+                preview_url: "https://a/2"
+            }
+        );
+        for (o, p) in [
+            ("http://a/1", "https://a/2"),
+            ("https://a/1", "ftp://a/2"),
+            ("https://", "https://a/2"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                err(content(&image(o, p)).unwrap_err()),
+                (
+                    400,
+                    serde_json::json!({"error": "image_url_invalid", "message": "original_url and preview_url must be https URLs"})
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn messages_body_shapes() {
+        let b: MessagesBody = serde_json::from_value(serde_json::json!({
+            "to": {"channel_id": "c"},
+            "content": {"type": "image", "original_url": "https://a", "preview_url": "https://b"}
+        }))
+        .unwrap();
+        assert_eq!(b.bot_config_id, None);
+        assert_eq!(
+            b.to,
+            To::Channel {
+                channel_id: "c".into()
+            }
+        );
+        for bad in [
+            serde_json::json!({"to": {"user_id": "u", "channel_id": "c"}, "content": {"type": "text", "text": "x"}}),
+            serde_json::json!({"to": {}, "content": {"type": "text", "text": "x"}}),
+            serde_json::json!({"to": {"user_id": "u"}, "content": {"type": "file", "url": "x"}}),
+            serde_json::json!({"to": {"user_id": "u"}, "content": {"type": "text", "text": "x", "extra": 1}}),
+        ] {
+            assert!(serde_json::from_value::<MessagesBody>(bad).is_err());
+        }
     }
 
     #[test]
