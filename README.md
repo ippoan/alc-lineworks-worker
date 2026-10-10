@@ -15,12 +15,15 @@ bot を足すたびに登録画面へ PEM を貼らなくてよくする (bot_co
 rust-alc-api の同じ口 (`alc-notify::lineworks_channels::send_text_internal`) と同じ契約。呼び元 (ohishi-exp/rust-leave-worker の cron・
 ohishi-exp/nuxt-dtako-admin の dtako-scraper-relay・ippoan/auth-worker の device-notify) は status (2xx か) と失敗の本文しか読まない。
 
-- body: `{"channel_id": "<lineworks_channels.id>", "text": "…"}` か `{"recipient_id": "<notify_recipients.id>", "text": "…"}`
-  (キー無しと `null` は同じ「未指定」)。tenant のヘッダーは見ない — tenant は行から引く
+- body: `{"channel_id": "<lineworks_channels.id>", "text": "…"}` か `{"recipient_id": "<notify_recipients.id>", "bot_config_id": "<bot_configs.id>"?, "text": "…"}`
+  (キー無しと `null` は同じ「未指定」)。tenant のヘッダーは見ない — tenant は行から引く。
+  `bot_config_id` は recipient 宛のときだけ (個人宛てに使う bot の指定。channel 宛と一緒だと 400)
 - 流れ: 宛先の行 id → SECURITY DEFINER の `alc_api.lookup_lineworks_channel_for_send` (migration 129) / `lookup_notify_recipient_for_send` (130)
   で tenant を引く (`tenant_tx(Uuid::nil())` の中で呼ぶ) → その tenant の `tenant_tx` で bot_configs を読む → `client_secret_encrypted` を
   `SSO_ENCRYPTION_KEY` で復号 → JWT (RS256) → access token (scope `bot`) → 送信
-- bot の選び方: channel 宛は行の `bot_config_id`。recipient 宛は tenant の `provider = 'lineworks'` かつ有効な bot のうち `name` の順で最初 (rust と同じ。同名は id の順)
+- bot の選び方: channel 宛は行の `bot_config_id`。recipient 宛は `bot_config_id` があればその bot
+  (recipient 行から決めた tenant の `provider = 'lineworks'` かつ有効な行だけ。使えなければ 400 で、名前順には戻さず送らない)、無ければ
+  tenant の `provider = 'lineworks'` かつ有効な bot のうち `name` の順で最初 (rust と同じ。同名は id の順)
 - 送信先: `POST https://www.worksapis.com/v1.0/bots/{bot_id}/channels/{channel_id}/messages` / `…/users/{user_id}/messages`
 
 | status | 本文 | いつ |
@@ -29,6 +32,7 @@ ohishi-exp/nuxt-dtako-admin の dtako-scraper-relay・ippoan/auth-worker の dev
 | 400 | `{"error":"text_required","message":"text is empty"}` | text が空白だけ |
 | 400 | `{"error":"target_ambiguous",…}` / `{"error":"target_required",…}` | 宛先が両方 / どちらも無い |
 | 400 | `{"error":"recipient_not_lineworks",…}` / `{"error":"recipient_disabled",…}` | recipient が LINE WORKS 宛でない / 無効 |
+| 400 | `{"error":"bot_config_not_allowed",…}` / `{"error":"bot_config_unavailable",…}` | channel 宛と `bot_config_id` が一緒 / 指定の bot がその tenant に無い・無効・provider が lineworks でない |
 | 400・415・422 | axum の既定 | body が読めない (rust と同じ) |
 | 404 | `{"error":"channel_not_found"}` / `{"error":"recipient_not_found"}` | 行が無い |
 | 500 | `{"error":"internal_error","message":"<語>"}` | `get_failed`・`get_bot_config_failed`・`list_bot_configs_failed` (DB)・`bot_config_not_found`・`encryption_key_missing`・`decrypt_failed`・`private_key_missing`・`private_key_invalid` |
@@ -114,9 +118,9 @@ bash scripts/check_coverage_100.sh --use-cache cov.txt
 worker-build --release
 ```
 
-- 単体テスト (27 本): 復号 (rust の ring の暗号文を読み、ここの暗号文を rust が読む・固定の値)・PEM の 2 形式と `\n`・JWT の claim と署名の検証・
+- 単体テスト (28 本): 復号 (rust の ring の暗号文を読み、ここの暗号文を rust が読む・固定の値)・PEM の 2 形式と `\n`・JWT の claim と署名の検証・
   URL と form・token の cache (期限・Service Account・scope ごと)・エラーの文・入力の検証と応答の語
-- 実 DB (tests/send_db.rs、14 本。接続は実行用ロール `alc_api_rt`): 3 つの口を偽の LINE WORKS で端から端まで。lookup の関数の所有者の条件
+- 実 DB (tests/send_db.rs、15 本。接続は実行用ロール `alc_api_rt`): 3 つの口を偽の LINE WORKS で端から端まで。lookup の関数の所有者の条件
   (`lookup_owner_condition`: テストの DB は superuser が所有者で両方引ける。所有者を RLS の掛かるロールにすると FORCE RLS の
   `lineworks_channels` は 0 行・`notify_recipients` は 1 行) も確かめる
 - 実 DB のテストは `LINEWORKS_TEST_ADMIN_DATABASE_URL` が無ければ失敗する (skip しない)

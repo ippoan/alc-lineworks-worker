@@ -109,6 +109,80 @@ async fn recipient_send_picks_bot_by_name() {
     );
 }
 
+/// recipient 宛 + bot_config_id: 名前順の最初ではなく指定の bot で送る。
+/// 使えない指定 (別 tenant・無効・provider 違い・存在しない) は 400 で、名前順に戻さず何も送らない。
+/// channel 宛との併用は 400。指定なしは従来どおり名前順の最初
+#[tokio::test]
+async fn recipient_send_with_bot_config_id() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let first = bot(t, "1-first", "lineworks", true).await;
+    let chosen = bot(t, "2-chosen", "lineworks", true).await;
+    let disabled = bot(t, "3-disabled", "lineworks", false).await;
+    let line = bot(t, "4-line", "line", true).await;
+    let foreign = bot(other, "5-foreign", "lineworks", true).await;
+    let (row, user) = recipient(t, "lineworks", true).await;
+    let (ch, _) = channel(t, first.id, true).await;
+    let app = app(Opts::default()).await;
+
+    let got = send(
+        &app,
+        serde_json::json!({"recipient_id": row, "bot_config_id": chosen.id, "text": "hi"}),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, serde_json::json!({"ok": true}))
+    );
+    let seen = app.http.seen.lock().unwrap().clone();
+    assert_eq!(form_value(&seen[0].body, "client_id"), chosen.client_id);
+    assert_eq!(
+        seen[1].url,
+        format!("{BOTS_URL}{}/users/{user}/messages", chosen.bot_id)
+    );
+    app.http.seen.lock().unwrap().clear();
+
+    let unavailable = serde_json::json!({
+        "error": "bot_config_unavailable",
+        "message": "bot_config_id is not an enabled lineworks bot of the tenant"
+    });
+    for id in [foreign.id, disabled.id, line.id, Uuid::new_v4()] {
+        let got = send(
+            &app,
+            serde_json::json!({"recipient_id": row, "bot_config_id": id, "text": "hi"}),
+        )
+        .await;
+        assert_eq!((got.status, got.json()), (400, unavailable.clone()));
+    }
+    let got = send(
+        &app,
+        serde_json::json!({"channel_id": ch, "bot_config_id": chosen.id, "text": "hi"}),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            400,
+            serde_json::json!({"error": "bot_config_not_allowed", "message": "bot_config_id is only for recipient_id"})
+        )
+    );
+    assert!(app.http.seen.lock().unwrap().is_empty());
+
+    // 指定なし・null は従来どおり名前順の最初
+    for body in [
+        serde_json::json!({"recipient_id": row, "text": "hi"}),
+        serde_json::json!({"recipient_id": row, "bot_config_id": null, "text": "hi"}),
+    ] {
+        let got = send(&app, body).await;
+        assert_eq!(got.status, 200);
+        let seen = app.http.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.last().unwrap().url,
+            format!("{BOTS_URL}{}/users/{user}/messages", first.bot_id)
+        );
+    }
+}
+
 /// lookup の 2 関数を、実行用ロール alc_api_rt が tenant を設定しない状態 (nil UUID) で呼べること・
 /// 関数の所有者の条件で見え方が変わること。
 /// - テストの DB は superuser が migration を流すので、関数の所有者は superuser (RLS を素通りする) → 両方 1 行
@@ -498,6 +572,21 @@ async fn db_failures() {
             ["lineworks-send: bot config failed: db (42501)"]
         );
     }
+
+    // recipient 宛 + bot 指定の段
+    let app = build(client_as(NO_BOT_ROLE).await, Opts::default());
+    let got = send(
+        &app,
+        serde_json::json!({"recipient_id": rc, "bot_config_id": b.id, "text": "x"}),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            500,
+            serde_json::json!({"error": "internal_error", "message": "get_bot_config_failed"})
+        )
+    );
 
     // token の口
     let app = build(broken_client().await, Opts::default());

@@ -27,6 +27,11 @@ pub mod sql {
         "SELECT client_id, client_secret_encrypted, service_account, bot_id \
          FROM alc_api.bot_configs WHERE tenant_id = $1 AND id = $2";
 
+    /// recipient 宛 (bot 指定): 指定の bot が、その tenant の有効な LINE WORKS の bot のときだけ返る
+    pub const LINEWORKS_BOT_CONFIG_BY_ID: &str =
+        "SELECT client_id, client_secret_encrypted, service_account, bot_id \
+         FROM alc_api.bot_configs WHERE tenant_id = $1 AND id = $2 AND provider = 'lineworks' AND enabled";
+
     /// recipient 宛: tenant の有効な LINE WORKS の bot のうち名前の順で最初の 1 つ
     /// (rust の `pick_lineworks_bot_config_id` = `list_configs` の `ORDER BY name` の最初。同じ名前は id の順)
     pub const BOT_CONFIG_FOR_TENANT: &str =
@@ -163,6 +168,27 @@ pub async fn bot_config_for_tenant(
             Box::pin(async move {
                 let row = tx
                     .query_typed_opt(sql::BOT_CONFIG_FOR_TENANT, &[(&tenant_id, Type::UUID)])
+                    .await?;
+                Ok(row.as_ref().map(bot_tuple))
+            })
+        })
+        .await?;
+    Ok(row.map(bot_row))
+}
+
+pub async fn lineworks_bot_config_by_id(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    bot_config_id: Uuid,
+) -> Result<Option<BotConfigRow>, Error> {
+    let row = pg
+        .tenant_tx(tenant_id, move |tx| {
+            Box::pin(async move {
+                let row = tx
+                    .query_typed_opt(
+                        sql::LINEWORKS_BOT_CONFIG_BY_ID,
+                        &[(&tenant_id, Type::UUID), (&bot_config_id, Type::UUID)],
+                    )
                     .await?;
                 Ok(row.as_ref().map(bot_tuple))
             })
