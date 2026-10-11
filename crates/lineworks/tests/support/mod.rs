@@ -24,8 +24,8 @@ use futures_util::lock::Mutex;
 use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, Http, HttpError, HttpRequest, HttpResponse, TokenCache};
 use lineworks::{
-    router, DeployCheck, DeployTarget, SendState, SentRecord, DEPLOY_CHECK_PATH,
-    LOGIN_ACTIVITY_PATH, MESSAGES_PATH, SEND_PATH, TOKEN_PATH, USERS_PATH,
+    router, DeployCheck, SendState, SentRecord, DEPLOY_CHECK_PATH, LOGIN_ACTIVITY_PATH,
+    MESSAGES_PATH, SEND_PATH, TOKEN_PATH, USERS_PATH,
 };
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
@@ -443,7 +443,7 @@ impl Http for FakeLineworks {
     }
 }
 
-/// 偽の「この版でもう送った」の記録 (worker の Cache API の代わり)。記録した版を順に持つ
+/// 偽の「この鍵でもう送った」の記録 (worker の Cache API の代わり)。記録した鍵を順に持つ
 #[derive(Default)]
 pub struct FakeRecord {
     pub versions: StdMutex<Vec<String>>,
@@ -476,9 +476,8 @@ pub struct Opts {
     pub activity: Arc<ActivityCache>,
     /// テストの「今」(UNIX 秒)
     pub now: u64,
-    /// デプロイの確認の口の (版の id, tag)・送り先・記録
+    /// デプロイの確認の口の (版の id, tag)・記録
     pub version: (String, String),
-    pub deploy_target: Option<DeployTarget>,
     pub record: Arc<FakeRecord>,
 }
 
@@ -492,7 +491,6 @@ impl Default for Opts {
             activity: Arc::default(),
             now: NOW,
             version: ("0123456789abcdef".into(), String::new()),
-            deploy_target: None,
             record: Arc::default(),
         }
     }
@@ -523,7 +521,6 @@ pub fn build(pg: PgClient, opts: Opts) -> App {
         deploy: DeployCheck {
             version: opts.version.0,
             tag: opts.version.1,
-            target: opts.deploy_target,
             record: opts.record.clone(),
         },
     };
@@ -628,6 +625,27 @@ pub async fn login_activity(app: &App, tenant: Option<&str>, query: &str) -> Got
     get_path(app, LOGIN_ACTIVITY_PATH, tenant, query).await
 }
 
-pub async fn deploy_check(app: &App) -> Got {
-    get_path(app, DEPLOY_CHECK_PATH, None, "").await
+/// デプロイの確認の口を打つ (`headers` は proxy が付け直すヘッダーの代わり。`query` は `?` の後ろ)
+pub async fn deploy_check(app: &App, headers: &[(&str, &str)], query: &str) -> Got {
+    let uri = if query.is_empty() {
+        DEPLOY_CHECK_PATH.to_owned()
+    } else {
+        format!("{DEPLOY_CHECK_PATH}?{query}")
+    };
+    let mut b = Request::builder().method("GET").uri(uri);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(b.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Got { status, body }
 }

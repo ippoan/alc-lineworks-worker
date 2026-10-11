@@ -100,7 +100,8 @@ pub struct SendState {
     pub deploy: DeployCheck,
 }
 
-/// 送信の口とデプロイの確認の口は tenant のヘッダーを見ない。ほかの口にだけ tenant の layer を掛ける
+/// 送信の口は tenant のヘッダーを見ない。デプロイの確認の口は tenant の layer を掛けず自分で読む (無ければ 401 ではなく `no_user`)。
+/// ほかの口にだけ tenant の layer を掛ける
 pub fn router() -> Router<SendState> {
     let tenant = Router::new()
         .route(TOKEN_PATH, post(issue_token))
@@ -325,13 +326,16 @@ pub fn read_error_response(e: &SendError, scope: &str) -> ApiError {
 }
 
 impl SendState {
-    pub(crate) fn fail(&self, stage: &str, e: &tokio_postgres::Error, msg: &str) -> ApiError {
+    fn fail(&self, stage: &str, e: &tokio_postgres::Error, msg: &str) -> ApiError {
         (self.log)(&format!("lineworks-send: {stage} failed: db ({})", kind(e)));
         internal_error_msg(msg)
     }
 
     /// bot の設定を復号して送れる形にする (rust の `resolve_bot_config`。鍵の有無はここで見る)
-    fn credentials(&self, row: BotConfigRow) -> Result<(Credentials, Arc<str>), ApiError> {
+    pub(crate) fn credentials(
+        &self,
+        row: BotConfigRow,
+    ) -> Result<(Credentials, Arc<str>), ApiError> {
         let Some(sso_key) = self.sso_key.as_deref() else {
             (self.log)("lineworks-send: SSO_ENCRYPTION_KEY not set");
             return Err(internal_error_msg("encryption_key_missing"));
@@ -355,7 +359,7 @@ impl SendState {
         ))
     }
 
-    fn client(&self) -> Client<'_> {
+    pub(crate) fn client(&self) -> Client<'_> {
         Client {
             http: self.http.as_ref(),
             endpoints: &self.endpoints,
@@ -375,7 +379,7 @@ impl SendState {
     }
 
     /// tenant の bot (`bot_config_id` があればその行、無ければ既定の bot。どちらも無ければ 404)
-    async fn tenant_bot(
+    pub(crate) async fn tenant_bot(
         &self,
         tenant_id: Uuid,
         bot_config_id: Option<Uuid>,
@@ -392,7 +396,7 @@ impl SendState {
         .ok_or_else(|| not_found("bot_config_not_found"))
     }
 
-    pub(crate) async fn deliver(
+    async fn deliver(
         &self,
         row: BotConfigRow,
         dest: Destination,

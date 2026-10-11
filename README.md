@@ -111,24 +111,29 @@ auth-worker の alc-internal-proxy の allowlist には載せない。
 | 502 | `{"error":"upstream_error","message":"Read users failed: HTTP 500"}` など | LINE WORKS の失敗 (本文は載せない) |
 | 502 | `{"error":"csv_columns_not_recognized","message":"member/email column not found"}` | auth の監査ログの見出しが読めない (rust と違い、見出しの中身は載せない) |
 
-### `GET /api/lineworks/deploy-check` (本番デプロイの確認)
+### `GET /api/lineworks/deploy-check[?bot_config_id=]` (本番デプロイの確認)
 
 本番に出したあと、親 (Claude) が auth-worker の verify_eval (GET だけ通る) で 1 回叩くと、新しい版の送信経路で固定文
-「alc-lineworks-worker <tag または版の id の先頭 8 文字> を本番に出しました (デプロイ確認)」が LINE WORKS へ 1 通届く
-(Refs ippoan/rust-alc-api#747。実装は `crates/lineworks/src/deploy_check.rs`)。
+「alc-lineworks-worker <tag または版の id の先頭 8 文字> を本番に出しました (デプロイ確認)」が**叩いた人の LINE WORKS** へ 1 通届く
+(Refs ippoan/rust-alc-api#747。実装は `crates/lineworks/src/deploy_check.rs`)。secret は増やさない。
 
-- 版は `CF_VERSION_METADATA` の id と tag。同じ版でもう送っていれば送らない。「送った」の記録は Cache API の `caches.default` に
-  版の id を鍵にした 1 件 (`src/deploy.rs`。colo ごとなので別の colo から叩けば 2 通目が出得る)
-- 送り先は `wrangler secret put` の 3 つ: `DEPLOY_CHECK_TENANT_ID`・`DEPLOY_CHECK_BOT_ID` (bot_configs の `bot_id`。その tenant の
-  有効な LINE WORKS の bot)・`DEPLOY_CHECK_USER_ID` (LINE WORKS の user_id)。wrangler.toml には書かない。staging は入れない
-- tenant のヘッダーは見ない (呼び手が誰でも送り先は変わらない)。送信は送信の口と同じ処理
+- 呼び手は auth-worker の browser proxy (`/alc-proxy`)。proxy が JWT から付け直す `X-Tenant-ID`・`X-User-Email` を使う
+- bot は messages / users の口と同じ (`bot_config_id` があればその tenant のその行、無ければ tenant の有効な LINE WORKS の bot の名前順の最初)
+- 送り先の user_id は、その bot で組織のメンバー (users の口と同じ。`directory.read`) を取り、メールが一致する人 (大文字小文字は区別しない)
+- 版は `CF_VERSION_METADATA` の id と tag。同じ版・同じ人にもう送っていれば送らない (人ごとに版 1 回)。「送った」の記録は Cache API の
+  `caches.default` に (版, tenant, メールの 16 進) を鍵にした 1 件 (`src/deploy.rs`。colo ごとなので別の colo から叩けば 2 通目が出得る)
+- 送信は送信の口と同じ処理
 
 | status | 本文 | いつ |
 |---|---|---|
 | 200 | `{"version","tag","sent":true,"reason":"sent"}` | 送って記録した |
-| 200 | `… "sent":false,"reason":"already_sent"` | この版でもう送った |
-| 200 | `… "sent":false,"reason":"not_configured"` | secret の 3 つのどれかが無い (tenant が UUID でない) か、版が取れない |
-| 502 | `… "sent":false,"reason":"send_failed"` | bot が無い・DB・鍵・LINE WORKS の失敗 (本文に識別子・エラー文を入れない。記録しないので次でまた試す) |
+| 200 | `… "sent":false,"reason":"already_sent"` | この版・この人にもう送った |
+| 200 | `… "sent":false,"reason":"not_configured"` | 版が取れない |
+| 200 | `… "sent":false,"reason":"no_user"` | `X-Tenant-ID` (UUID) か `X-User-Email` が無い |
+| 200 | `… "sent":false,"reason":"no_bot"` | tenant に使える bot が無い (別 tenant の `bot_config_id` も) |
+| 200 | `… "sent":false,"reason":"user_not_found"` | 組織にメールの一致する人が居ない |
+| 400 | axum の既定 | `bot_config_id` が UUID でない |
+| 502 | `… "sent":false,"reason":"send_failed"` | DB・鍵・LINE WORKS (メンバーの一覧・送信) の失敗 (本文に識別子・エラー文を入れない。記録しないので次でまた試す) |
 
 ### access token の cache
 
@@ -152,7 +157,6 @@ isolate の中で (Client ID, Service Account, scope) ごとに、有効期限�
 | `SSO_ENCRYPTION_KEY` | Secrets Store `sso-encryption-key` (auth-worker と同じ) | ○ | ○ |
 | `LINEWORKS_PRIVATE_KEY` | Secrets Store `LINEWORKS_PRIVATE_KEY` (正本は GCP Secret Manager の同名) | ○ | ○ |
 | `CF_VERSION_METADATA` | version metadata (`x-worker-version` / `x-worker-tag`・deploy-check の版) | ○ | ○ |
-| `DEPLOY_CHECK_TENANT_ID`・`DEPLOY_CHECK_BOT_ID`・`DEPLOY_CHECK_USER_ID` | `wrangler secret put` (deploy-check の送り先。wrangler.toml に書かない) | ○ | — |
 
 DB への経路は ohishi-exp/rust-leave-worker の `src/db.rs` と同じ (staging = VPC → PgBouncer、本番 = Hyperdrive、ローカル = `--env local` の `DATABASE_URL`)。
 

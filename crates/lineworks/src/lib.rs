@@ -19,7 +19,7 @@ pub mod jwt;
 pub mod pg;
 pub mod routes;
 
-pub use deploy_check::{DeployCheck, DeployTarget, SentRecord, DEPLOY_CHECK_PATH};
+pub use deploy_check::{DeployCheck, SentRecord, DEPLOY_CHECK_PATH};
 pub use routes::{
     router, LogSink, Now, SendState, LOGIN_ACTIVITY_PATH, MESSAGES_PATH, SEND_PATH, TOKEN_PATH,
     USERS_PATH,

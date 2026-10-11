@@ -8,9 +8,9 @@
 //! 秘密値は Secrets Store から、6 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
 //! `LINEWORKS_PRIVATE_KEY` (JWT の署名。全 bot で共有する 1 本)。LINE WORKS の access token は isolate の中で使い回す。
 //!
-//! デプロイの確認の口 (`GET /api/lineworks/deploy-check`) の送り先は `wrangler secret put` の 3 つ
-//! (`DEPLOY_CHECK_TENANT_ID`・`DEPLOY_CHECK_BOT_ID`・`DEPLOY_CHECK_USER_ID`。wrangler.toml には書かない)、
-//! 「この版でもう送った」の記録は Cache API の `caches.default` ([`deploy::CacheRecord`])。
+//! デプロイの確認の口 (`GET /api/lineworks/deploy-check`) の送り先は、auth-worker の browser proxy が付ける
+//! `X-Tenant-ID`・`X-User-Email` の本人 (secret は増やさない)。「この版でもう送った」の記録は Cache API の
+//! `caches.default` ([`deploy::CacheRecord`])。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/lineworks だけを検査させる
@@ -29,8 +29,8 @@ use futures_util::lock::Mutex;
 use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, TokenCache};
 use lineworks::{
-    router, DeployCheck, DeployTarget, LogSink, SendState, DEPLOY_CHECK_PATH, LOGIN_ACTIVITY_PATH,
-    MESSAGES_PATH, SEND_PATH, TOKEN_PATH, USERS_PATH,
+    router, DeployCheck, LogSink, SendState, DEPLOY_CHECK_PATH, LOGIN_ACTIVITY_PATH, MESSAGES_PATH,
+    SEND_PATH, TOKEN_PATH, USERS_PATH,
 };
 use tower_service::Service;
 use worker::{
@@ -80,25 +80,6 @@ async fn secret(env: &Env, binding: &str) -> Option<Arc<str>> {
             console_error!("lineworks: no {binding} value");
             None
         }
-    }
-}
-
-/// `wrangler secret put` の値 (無ければ `None`)
-fn env_secret(env: &Env, name: &str) -> Option<String> {
-    env.secret(name).ok().map(|s| s.to_string())
-}
-
-/// デプロイの確認の口の材料 (版は `CF_VERSION_METADATA` の (id, tag)、送り先は secret の 3 つ)
-fn deploy_check(env: &Env, (version, tag): (String, String)) -> DeployCheck {
-    DeployCheck {
-        version,
-        tag,
-        target: DeployTarget::from_values(
-            env_secret(env, "DEPLOY_CHECK_TENANT_ID"),
-            env_secret(env, "DEPLOY_CHECK_BOT_ID"),
-            env_secret(env, "DEPLOY_CHECK_USER_ID"),
-        ),
-        record: Arc::new(deploy::CacheRecord),
     }
 }
 
@@ -156,7 +137,11 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         sso_key,
         private_key,
         log: log_sink(),
-        deploy: deploy_check(&env, version.clone()),
+        deploy: DeployCheck {
+            version: version.0.clone(),
+            tag: version.1.clone(),
+            record: Arc::new(deploy::CacheRecord),
+        },
     };
     let mut resp = match router().with_state(state).call(req).await {
         Ok(r) => r,
