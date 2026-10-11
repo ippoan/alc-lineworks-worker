@@ -5,14 +5,19 @@
 //! **この Worker は呼び手を認証しない。** 本番・staging とも workers.dev を開けず (`workers_dev` / `preview_urls` = false、
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
-//! 秘密値は Secrets Store から、5 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
+//! 秘密値は Secrets Store から、6 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
 //! `LINEWORKS_PRIVATE_KEY` (JWT の署名。全 bot で共有する 1 本)。LINE WORKS の access token は isolate の中で使い回す。
+//!
+//! デプロイの確認の口 (`GET /api/lineworks/deploy-check`) の送り先は `wrangler secret put` の 3 つ
+//! (`DEPLOY_CHECK_TENANT_ID`・`DEPLOY_CHECK_BOT_ID`・`DEPLOY_CHECK_USER_ID`。wrangler.toml には書かない)、
+//! 「この版でもう送った」の記録は Cache API の `caches.default` ([`deploy::CacheRecord`])。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/lineworks だけを検査させる
 #![cfg(target_arch = "wasm32")]
 
 mod db;
+mod deploy;
 mod http;
 mod tcp;
 
@@ -24,8 +29,8 @@ use futures_util::lock::Mutex;
 use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, TokenCache};
 use lineworks::{
-    router, LogSink, SendState, LOGIN_ACTIVITY_PATH, MESSAGES_PATH, SEND_PATH, TOKEN_PATH,
-    USERS_PATH,
+    router, DeployCheck, DeployTarget, LogSink, SendState, DEPLOY_CHECK_PATH, LOGIN_ACTIVITY_PATH,
+    MESSAGES_PATH, SEND_PATH, TOKEN_PATH, USERS_PATH,
 };
 use tower_service::Service;
 use worker::{
@@ -52,8 +57,9 @@ fn activity_cache() -> Arc<ActivityCache> {
 }
 
 /// 秘密値を引く口 (ほかの path では Secrets Store を読まない)
-const SECRET_PATHS: [&str; 5] = [
+const SECRET_PATHS: [&str; 6] = [
     SEND_PATH,
+    DEPLOY_CHECK_PATH,
     TOKEN_PATH,
     MESSAGES_PATH,
     USERS_PATH,
@@ -74,6 +80,25 @@ async fn secret(env: &Env, binding: &str) -> Option<Arc<str>> {
             console_error!("lineworks: no {binding} value");
             None
         }
+    }
+}
+
+/// `wrangler secret put` の値 (無ければ `None`)
+fn env_secret(env: &Env, name: &str) -> Option<String> {
+    env.secret(name).ok().map(|s| s.to_string())
+}
+
+/// デプロイの確認の口の材料 (版は `CF_VERSION_METADATA` の (id, tag)、送り先は secret の 3 つ)
+fn deploy_check(env: &Env, (version, tag): (String, String)) -> DeployCheck {
+    DeployCheck {
+        version,
+        tag,
+        target: DeployTarget::from_values(
+            env_secret(env, "DEPLOY_CHECK_TENANT_ID"),
+            env_secret(env, "DEPLOY_CHECK_BOT_ID"),
+            env_secret(env, "DEPLOY_CHECK_USER_ID"),
+        ),
+        record: Arc::new(deploy::CacheRecord),
     }
 }
 
@@ -116,6 +141,11 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     } else {
         (None, None)
     };
+    // 版の (id, tag)。binding が取れなければ両方空
+    let version = env
+        .get_binding::<WorkerVersionMetadata>("CF_VERSION_METADATA")
+        .map(|meta| (meta.id(), meta.tag()))
+        .unwrap_or_default();
     let state = SendState {
         pg: Arc::new(Mutex::new(pg)),
         http: Arc::new(WorkerHttp),
@@ -126,21 +156,20 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         sso_key,
         private_key,
         log: log_sink(),
+        deploy: deploy_check(&env, version.clone()),
     };
     let mut resp = match router().with_state(state).call(req).await {
         Ok(r) => r,
         Err(e) => match e {},
     };
     // どの版が応えたかを応答ヘッダーで分かるようにする。binding が取れなければ何も付けない
-    if let Ok(meta) = env.get_binding::<WorkerVersionMetadata>("CF_VERSION_METADATA") {
-        if let Ok(v) = HeaderValue::from_str(&meta.id()) {
-            resp.headers_mut().insert("x-worker-version", v);
+    let (id, tag) = version;
+    for (name, value) in [("x-worker-version", id), ("x-worker-tag", tag)] {
+        if value.is_empty() {
+            continue;
         }
-        let tag = meta.tag();
-        if !tag.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(&tag) {
-                resp.headers_mut().insert("x-worker-tag", v);
-            }
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            resp.headers_mut().insert(name, v);
         }
     }
     Ok(resp)

@@ -22,10 +22,14 @@ path = "crates/lineworks/src/client.rs"
 [[files]]
 path = "crates/lineworks/src/pg.rs"
 
-# 5 つの口 (400 / 401 / 403 / 404 / 405 / 422 / 500 / 502 の本文とログまで)
+# 6 つの口 (400 / 401 / 403 / 404 / 405 / 422 / 500 / 502 の本文とログまで)
 [[files]]
 path = "crates/lineworks/src/routes.rs"
 
 # ログイン状況の集計 (監査ログの CSV・3 つの信号の合成・並び・cache。tests/send_db.rs が口から通す)
 [[files]]
 path = "crates/lineworks/src/activity.rs"
+
+# 本番デプロイの確認の口 (版が変わったら 1 通だけ送る。tests/send_db.rs が口から通す)
+[[files]]
+path = "crates/lineworks/src/deploy_check.rs"

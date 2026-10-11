@@ -1,4 +1,4 @@
-//! 口は 5 つ。どれも認証は持たない (入口は auth-worker からの Service Binding だけ。wrangler.toml と scripts/check-exposure.sh)。
+//! 口は 6 つ (6 つ目の本番デプロイの確認 `GET /api/lineworks/deploy-check` は [`crate::deploy_check`])。どれも認証は持たない (入口は auth-worker からの Service Binding だけ。wrangler.toml と scripts/check-exposure.sh)。
 //!
 //! ## `POST /api/internal/lineworks/send` (rust-alc-api の `alc-notify::lineworks_channels::send_text_internal` と同じ契約)
 //!
@@ -69,6 +69,7 @@ use crate::client::{
     Client, Content, Credentials, Destination, Endpoints, Http, LineworksMember, SendError,
     TokenCache, ALLOWED_SCOPES, AUDIT_SCOPE, DIRECTORY_SCOPE,
 };
+use crate::deploy_check::{self, DeployCheck, DEPLOY_CHECK_PATH};
 use crate::pg::{self, BotConfigRow, RecipientRow};
 
 pub const SEND_PATH: &str = "/api/internal/lineworks/send";
@@ -95,9 +96,11 @@ pub struct SendState {
     /// `LINEWORKS_PRIVATE_KEY` (Secrets Store、PEM)。取れなければ `None`
     pub private_key: Option<Arc<str>>,
     pub log: LogSink,
+    /// 本番デプロイの確認の口の材料 (版・送り先・送った記録)
+    pub deploy: DeployCheck,
 }
 
-/// 送信の口は tenant のヘッダーを見ない。ほかの口にだけ tenant の layer を掛ける
+/// 送信の口とデプロイの確認の口は tenant のヘッダーを見ない。ほかの口にだけ tenant の layer を掛ける
 pub fn router() -> Router<SendState> {
     let tenant = Router::new()
         .route(TOKEN_PATH, post(issue_token))
@@ -107,6 +110,7 @@ pub fn router() -> Router<SendState> {
         .route_layer(middleware::from_fn(require_tenant_header));
     Router::new()
         .route(SEND_PATH, post(send_text))
+        .route(DEPLOY_CHECK_PATH, get(deploy_check::deploy_check))
         .merge(tenant)
 }
 
@@ -321,7 +325,7 @@ pub fn read_error_response(e: &SendError, scope: &str) -> ApiError {
 }
 
 impl SendState {
-    fn fail(&self, stage: &str, e: &tokio_postgres::Error, msg: &str) -> ApiError {
+    pub(crate) fn fail(&self, stage: &str, e: &tokio_postgres::Error, msg: &str) -> ApiError {
         (self.log)(&format!("lineworks-send: {stage} failed: db ({})", kind(e)));
         internal_error_msg(msg)
     }
@@ -388,7 +392,7 @@ impl SendState {
         .ok_or_else(|| not_found("bot_config_not_found"))
     }
 
-    async fn deliver(
+    pub(crate) async fn deliver(
         &self,
         row: BotConfigRow,
         dest: Destination,

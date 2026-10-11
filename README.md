@@ -111,16 +111,35 @@ auth-worker の alc-internal-proxy の allowlist には載せない。
 | 502 | `{"error":"upstream_error","message":"Read users failed: HTTP 500"}` など | LINE WORKS の失敗 (本文は載せない) |
 | 502 | `{"error":"csv_columns_not_recognized","message":"member/email column not found"}` | auth の監査ログの見出しが読めない (rust と違い、見出しの中身は載せない) |
 
+### `GET /api/lineworks/deploy-check` (本番デプロイの確認)
+
+本番に出したあと、親 (Claude) が auth-worker の verify_eval (GET だけ通る) で 1 回叩くと、新しい版の送信経路で固定文
+「alc-lineworks-worker <tag または版の id の先頭 8 文字> を本番に出しました (デプロイ確認)」が LINE WORKS へ 1 通届く
+(Refs ippoan/rust-alc-api#747。実装は `crates/lineworks/src/deploy_check.rs`)。
+
+- 版は `CF_VERSION_METADATA` の id と tag。同じ版でもう送っていれば送らない。「送った」の記録は Cache API の `caches.default` に
+  版の id を鍵にした 1 件 (`src/deploy.rs`。colo ごとなので別の colo から叩けば 2 通目が出得る)
+- 送り先は `wrangler secret put` の 3 つ: `DEPLOY_CHECK_TENANT_ID`・`DEPLOY_CHECK_BOT_ID` (bot_configs の `bot_id`。その tenant の
+  有効な LINE WORKS の bot)・`DEPLOY_CHECK_USER_ID` (LINE WORKS の user_id)。wrangler.toml には書かない。staging は入れない
+- tenant のヘッダーは見ない (呼び手が誰でも送り先は変わらない)。送信は送信の口と同じ処理
+
+| status | 本文 | いつ |
+|---|---|---|
+| 200 | `{"version","tag","sent":true,"reason":"sent"}` | 送って記録した |
+| 200 | `… "sent":false,"reason":"already_sent"` | この版でもう送った |
+| 200 | `… "sent":false,"reason":"not_configured"` | secret の 3 つのどれかが無い (tenant が UUID でない) か、版が取れない |
+| 502 | `… "sent":false,"reason":"send_failed"` | bot が無い・DB・鍵・LINE WORKS の失敗 (本文に識別子・エラー文を入れない。記録しないので次でまた試す) |
+
 ### access token の cache
 
-isolate の中で (Client ID, Service Account, scope) ごとに、有効期限の 60 秒前まで使い回す (5 つの口で共有)。
+isolate の中で (Client ID, Service Account, scope) ごとに、有効期限の 60 秒前まで使い回す (6 つの口で共有)。
 
 ## 配置
 
 | 場所 | 中身 |
 |---|---|
-| 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (wasm32 専用)。`src/lib.rs` (載せ方・Secrets Store の読み出し・token とログイン状況の cache)・`src/db.rs` (DB への経路)・`src/http.rs` (`worker::Fetch`。GET は `redirect: "manual"`)・`src/tcp.rs` (VPC の binding) |
-| `crates/lineworks/` | `routes` (5 つの口)・`pg` (SQL)・`jwt` (LINE WORKS の claim。復号と RS256 の署名は kit の `alc-worker-crypto`)・`client` (URL・form・token・送信・読み取り・cache。HTTP は trait 越し)・`activity` (ログイン状況の集計) |
+| 直下 (`Cargo.toml`・`wrangler.toml`・`src/`) | Worker 本体 (wasm32 専用)。`src/lib.rs` (載せ方・Secrets Store の読み出し・token とログイン状況の cache)・`src/db.rs` (DB への経路)・`src/http.rs` (`worker::Fetch`。GET は `redirect: "manual"`)・`src/tcp.rs` (VPC の binding)・`src/deploy.rs` (deploy-check の記録 = Cache API) |
+| `crates/lineworks/` | `routes` (口)・`pg` (SQL)・`jwt` (LINE WORKS の claim。復号と RS256 の署名は kit の `alc-worker-crypto`)・`client` (URL・form・token・送信・読み取り・cache。HTTP は trait 越し)・`activity` (ログイン状況の集計)・`deploy_check` (本番デプロイの確認の口) |
 | `scripts/` | 公開範囲の検査と陰性対照・`fetch-migrations.sh` (版は `ALC_MIGRATIONS_REV`)・coverage の gate (登録簿は `coverage_100.toml`) |
 | `.github/workflows/` | `ci.yml` (検査) / `deploy.yml` (PR = dry-run・main = staging・タグ `v*` = 本番) / `tag-release.yml` (手動のタグ) |
 
@@ -132,7 +151,8 @@ isolate の中で (Client ID, Service Account, scope) ごとに、有効期限�
 | `LINEWORKS_DB_VPC` | Workers VPC (vein の staging と共有) | — | ○ |
 | `SSO_ENCRYPTION_KEY` | Secrets Store `sso-encryption-key` (auth-worker と同じ) | ○ | ○ |
 | `LINEWORKS_PRIVATE_KEY` | Secrets Store `LINEWORKS_PRIVATE_KEY` (正本は GCP Secret Manager の同名) | ○ | ○ |
-| `CF_VERSION_METADATA` | version metadata (`x-worker-version` / `x-worker-tag`) | ○ | ○ |
+| `CF_VERSION_METADATA` | version metadata (`x-worker-version` / `x-worker-tag`・deploy-check の版) | ○ | ○ |
+| `DEPLOY_CHECK_TENANT_ID`・`DEPLOY_CHECK_BOT_ID`・`DEPLOY_CHECK_USER_ID` | `wrangler secret put` (deploy-check の送り先。wrangler.toml に書かない) | ○ | — |
 
 DB への経路は ohishi-exp/rust-leave-worker の `src/db.rs` と同じ (staging = VPC → PgBouncer、本番 = Hyperdrive、ローカル = `--env local` の `DATABASE_URL`)。
 
@@ -152,7 +172,7 @@ worker-build --release
 - 単体テスト (47 本): 復号 (rust の ring の暗号文を読み、ここの暗号文を rust が読む・固定の値)・PEM の 2 形式と `\n`・JWT の claim と署名の検証・
   URL と form・token の cache (期限・Service Account・scope ごと)・エラーの文・入力の検証と応答の語・users の全ページ・
   リダイレクトの手での追従と失敗・掲示板の上限・監査ログの CSV (rust の単体テストの期待値)・3 つの信号の合成・しきい値と並び
-- 実 DB (tests/send_db.rs、19 本。接続は実行用ロール `alc_api_rt`): 5 つの口を偽の LINE WORKS で端から端まで。lookup の関数の所有者の条件
+- 実 DB (tests/send_db.rs、22 本。接続は実行用ロール `alc_api_rt`): 6 つの口を偽の LINE WORKS で端から端まで。lookup の関数の所有者の条件
   (`lookup_owner_condition`: テストの DB は superuser が所有者で両方引ける。所有者を RLS の掛かるロールにすると FORCE RLS の
   `lineworks_channels` は 0 行・`notify_recipients` は 1 行) も確かめる
 - 実 DB のテストは `LINEWORKS_TEST_ADMIN_DATABASE_URL` が無ければ失敗する (skip しない)

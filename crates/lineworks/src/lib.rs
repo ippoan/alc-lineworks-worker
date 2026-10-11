@@ -10,13 +10,16 @@
 //! client_secret の復号 (rust と同じ AES-256-GCM) と RS256 の署名は ippoan/alc-worker-kit の `alc_worker_crypto` を使う。
 //! - [`client`] — LINE WORKS の token・送信・読み取り (users・監査ログ・掲示板)、token の cache (HTTP は trait 越し)
 //! - [`activity`] — ログイン状況の集計 (監査ログの CSV・3 つの信号の合成・並び・cache)
+//! - [`deploy_check`] — 本番デプロイの確認の口 `GET /api/lineworks/deploy-check` (版が変わったら 1 通だけ送る)
 
 pub mod activity;
 pub mod client;
+pub mod deploy_check;
 pub mod jwt;
 pub mod pg;
 pub mod routes;
 
+pub use deploy_check::{DeployCheck, DeployTarget, SentRecord, DEPLOY_CHECK_PATH};
 pub use routes::{
     router, LogSink, Now, SendState, LOGIN_ACTIVITY_PATH, MESSAGES_PATH, SEND_PATH, TOKEN_PATH,
     USERS_PATH,

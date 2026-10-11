@@ -1,4 +1,4 @@
-//! 5 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
+//! 6 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
 //! 接続先は `LINEWORKS_TEST_ADMIN_DATABASE_URL` (無ければ失敗する。tests/support)。
 
 mod support;
@@ -6,6 +6,7 @@ mod support;
 use std::sync::Arc;
 
 use lineworks::client::TokenCache;
+use lineworks::{DeployTarget, DEPLOY_CHECK_PATH};
 use support::*;
 use uuid::Uuid;
 
@@ -1454,5 +1455,223 @@ async fn login_activity_errors() {
         assert!(rows[..4].iter().all(|r| r["last_login_at"].is_null()));
         assert_eq!(*app.logs.lock().unwrap(), logs);
         assert_logs_clean(&app, &["u1", "a@x.com", &tid]);
+    }
+}
+
+// ---- deploy-check (Refs ippoan/rust-alc-api#747) ----
+
+fn deploy_target(t: Uuid, bot_id: &str, user_id: &str) -> Option<DeployTarget> {
+    Some(DeployTarget {
+        tenant_id: t,
+        bot_id: bot_id.into(),
+        user_id: user_id.into(),
+    })
+}
+
+fn deploy_reply(version: &str, tag: &str, sent: bool, reason: &str) -> serde_json::Value {
+    serde_json::json!({"version": version, "tag": tag, "sent": sent, "reason": reason})
+}
+
+/// 版が変わったら 1 通だけ: env で指す tenant の bot (bot_id) から LINE WORKS の user へ固定文を送り、版を記録する。
+/// 同じ版の 2 回目は送らない。別の版 (tag 付き) はまた送り、文は tag。tenant のヘッダーは見ない
+/// (別 tenant の X-Tenant-ID を付けても送り先は env のまま)。同じ bot_id でも provider 違いの行は使わない
+#[tokio::test]
+async fn deploy_check_sends_once_per_version() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let b = bot(t, "2-deploy", "lineworks", true).await;
+    let line = bot(t, "1-line", "line", true).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.bot_configs SET bot_id = $1 WHERE id = $2",
+            &[&b.bot_id, &line.id],
+        )
+        .await
+        .unwrap();
+    let record = Arc::new(FakeRecord::default());
+    let app = app(Opts {
+        deploy_target: deploy_target(t, &b.bot_id, "lw-me"),
+        record: record.clone(),
+        ..Opts::default()
+    })
+    .await;
+
+    let got = call_with(
+        &app,
+        "GET",
+        DEPLOY_CHECK_PATH,
+        Some(&other.to_string()),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, deploy_reply("0123456789abcdef", "", true, "sent"))
+    );
+    let seen = app.http.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "token 1 回 + 送信 1 回");
+    assert_eq!(form_value(&seen[0].body, "client_id"), b.client_id);
+    assert_eq!(form_value(&seen[0].body, "scope"), "bot");
+    assert_eq!(
+        seen[1].url,
+        format!("{BOTS_URL}{}/users/lw-me/messages", b.bot_id)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&seen[1].body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"content": {"type": "text", "text": "alc-lineworks-worker 01234567 を本番に出しました (デプロイ確認)"}})
+    );
+    assert_eq!(*record.versions.lock().unwrap(), ["0123456789abcdef"]);
+
+    let got = deploy_check(&app).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            200,
+            deploy_reply("0123456789abcdef", "", false, "already_sent")
+        )
+    );
+    assert_eq!(app.http.seen.lock().unwrap().len(), 2, "2 回目は送らない");
+
+    // 新しい版 (同じ記録を持つ別の isolate)
+    let app = app_with(Opts {
+        deploy_target: deploy_target(t, &b.bot_id, "lw-me"),
+        record: record.clone(),
+        version: ("fedcba9876543210".into(), "v0.1.4".into()),
+        ..Opts::default()
+    })
+    .await;
+    let got = deploy_check(&app).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            200,
+            deploy_reply("fedcba9876543210", "v0.1.4", true, "sent")
+        )
+    );
+    let seen = app.http.seen.lock().unwrap().clone();
+    let body: serde_json::Value = serde_json::from_slice(&seen[1].body).unwrap();
+    assert_eq!(
+        body["content"]["text"],
+        "alc-lineworks-worker v0.1.4 を本番に出しました (デプロイ確認)"
+    );
+    assert_eq!(
+        *record.versions.lock().unwrap(),
+        ["0123456789abcdef", "fedcba9876543210"]
+    );
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// 送り先が無い (staging) か版が取れない → 送らずに not_configured。DB も LINE WORKS も触らない
+/// (切れた接続でも not_configured)
+#[tokio::test]
+async fn deploy_check_not_configured() {
+    let t = tenant().await;
+    let b = bot(t, "main", "lineworks", true).await;
+    for (version, target) in [
+        (("0123456789abcdef".to_owned(), String::new()), None),
+        (
+            (String::new(), String::new()),
+            deploy_target(t, &b.bot_id, "lw-me"),
+        ),
+    ] {
+        let app = build(
+            broken_client().await,
+            Opts {
+                version: version.clone(),
+                deploy_target: target,
+                ..Opts::default()
+            },
+        );
+        let got = deploy_check(&app).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (200, deploy_reply(&version.0, "", false, "not_configured"))
+        );
+        assert!(app.http.seen.lock().unwrap().is_empty());
+        assert!(app.record.versions.lock().unwrap().is_empty());
+        assert!(app.logs.lock().unwrap().is_empty());
+    }
+}
+
+/// 送れない → 502 send_failed (本文は 4 つのキーだけ・識別子もエラー文も無い・ログは固定の語)。記録しないので
+/// 次の呼び出しでまた試す。LINE WORKS の失敗・bot が無い (bot_id 違い・無効・別 tenant)・user_id が path を崩す・
+/// DB の失敗・鍵が無い
+#[tokio::test]
+async fn deploy_check_send_failed() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let b = bot(t, "main", "lineworks", true).await;
+    let off = bot(t, "off", "lineworks", false).await;
+    let send_failed = deploy_reply("0123456789abcdef", "", false, "send_failed");
+    let fixed = "lineworks-deploy-check: send failed";
+    let opts = |target: Option<DeployTarget>| Opts {
+        deploy_target: target,
+        ..Opts::default()
+    };
+    let cases: Vec<(bool, Opts, Vec<&str>)> = vec![
+        (
+            true,
+            Opts {
+                http: FakeLineworks {
+                    send_status: 500,
+                    ..FakeLineworks::default()
+                },
+                ..opts(deploy_target(t, &b.bot_id, "lw-me"))
+            },
+            vec!["lineworks-send: Send failed: HTTP 500", fixed],
+        ),
+        (
+            true,
+            opts(deploy_target(t, "no-such-bot", "lw-me")),
+            vec![fixed],
+        ),
+        (
+            true,
+            opts(deploy_target(t, &off.bot_id, "lw-me")),
+            vec![fixed],
+        ),
+        (
+            true,
+            opts(deploy_target(other, &b.bot_id, "lw-me")),
+            vec![fixed],
+        ),
+        (true, opts(deploy_target(t, &b.bot_id, "a/b")), vec![fixed]),
+        (
+            false,
+            opts(deploy_target(t, &b.bot_id, "lw-me")),
+            vec!["lineworks-send: bot config failed: db (42501)", fixed],
+        ),
+        (
+            true,
+            Opts {
+                sso_key: None,
+                ..opts(deploy_target(t, &b.bot_id, "lw-me"))
+            },
+            vec!["lineworks-send: SSO_ENCRYPTION_KEY not set", fixed],
+        ),
+    ];
+    for (rt, opts, logs) in cases {
+        let pg = if rt {
+            rt_client().await
+        } else {
+            client_as(NO_BOT_ROLE).await
+        };
+        let app = build(pg, opts);
+        let got = deploy_check(&app).await;
+        assert_eq!((got.status, got.json()), (502, send_failed.clone()));
+        assert_eq!(*app.logs.lock().unwrap(), logs);
+        assert!(app.record.versions.lock().unwrap().is_empty());
+        assert_logs_clean(
+            &app,
+            &[
+                &t.to_string(),
+                &other.to_string(),
+                &b.bot_id,
+                &off.bot_id,
+                "lw-me",
+            ],
+        );
     }
 }
