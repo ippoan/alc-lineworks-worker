@@ -1,7 +1,8 @@
 # alc-lineworks-worker
 
 LINE WORKS の Worker `alc-lineworks` (Refs ohishi-exp/rust-leave-worker#1)。型は rust-leave-worker・alc-dtako-worker と同じ。
-口は 5 つ: `POST /api/internal/lineworks/send` (rust-alc-api と同じ契約。recipient 宛は `bot_config_id` で bot を指定でき、使えない指定は 400 で名前順に戻さない)・`POST /api/internal/lineworks/token` (auth-worker 向けの access token)・`POST /api/internal/lineworks/messages` (notify / trouble の worker 向け。tenant 指定で text / image を user / channel へ)・`GET /api/internal/lineworks/users` (組織のメンバー)・`GET /api/internal/lineworks/login-activity` (ログイン状況の集計。audit.read は worker の中だけで使い、token の口では出さない)。
+口は 6 つ: `POST /api/internal/lineworks/send` (rust-alc-api と同じ契約。recipient 宛は `bot_config_id` で bot を指定でき、使えない指定は 400 で名前順に戻さない)・`POST /api/internal/lineworks/token` (auth-worker 向けの access token)・`POST /api/internal/lineworks/messages` (notify / trouble の worker 向け。tenant 指定で text / image を user / channel へ)・`GET /api/internal/lineworks/users` (組織のメンバー)・`GET /api/internal/lineworks/login-activity` (ログイン状況の集計。audit.read は worker の中だけで使い、token の口では出さない)・`GET /api/lineworks/deploy-check` (本番デプロイの確認。`?to=` の相手に、版ごと 1 回だけ固定文を送る。記録は Cache API)。
+本番デプロイ後は親が auth-worker の verify_eval でこの GET を叩く。送り先は `?to=<LINE WORKS の user_id>` (その tenant = browser proxy の `X-Tenant-ID` の組織のメンバーに居る人だけ。`to` は応答・ログに出さない)。secret は使わない (増やさない)。
 直下 = Worker (wasm 専用)、`crates/lineworks/` = 口・SQL・JWT の claim・LINE WORKS の呼び方。
 復号 (`decrypt_secret`) と RS256 の署名 (`sign_rs256`) は kit の `alc-worker-crypto` を使う (この repo に写しを置かない)。詳細は `README.md`。
 
@@ -25,6 +26,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - token の口の scope は `client::ALLOWED_SCOPES` だけ。足すときは auth-worker の使う値を確かめる。
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/lineworks/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 39・send_db 19) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 41・send_db 22) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-core-wasm・alc-worker-db・alc-worker-crypto が同じ rev。`cargo tree -i` で出どころが 1 つ)。

@@ -1,4 +1,4 @@
-//! 5 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
+//! 6 つの口を、実 DB (`alc_api_rt` で接続) と偽の LINE WORKS で通す。
 //! 接続先は `LINEWORKS_TEST_ADMIN_DATABASE_URL` (無ければ失敗する。tests/support)。
 
 mod support;
@@ -1454,5 +1454,252 @@ async fn login_activity_errors() {
         assert!(rows[..4].iter().all(|r| r["last_login_at"].is_null()));
         assert_eq!(*app.logs.lock().unwrap(), logs);
         assert_logs_clean(&app, &["u1", "a@x.com", &tid]);
+    }
+}
+
+// ---- deploy-check (Refs ippoan/rust-alc-api#747) ----
+
+/// proxy が付け直すヘッダーの代わり (名前, 値)
+type Headers = Vec<(&'static str, String)>;
+
+fn deploy_reply(version: &str, tag: &str, sent: bool, reason: &str) -> serde_json::Value {
+    serde_json::json!({"version": version, "tag": tag, "sent": sent, "reason": reason})
+}
+
+/// `?to=` の相手に版ごと 1 回: tenant (`X-Tenant-ID`) の既定の bot (名前順の最初) で組織のメンバーを取り、`to` が居れば
+/// 固定文を送り、(版, tenant, to のハッシュ) を記録する。同じ版・同じ相手の 2 回目は送らない。別の相手はまた送る。
+/// 別の版 (tag 付き) はまた送り、文は tag。`bot_config_id` を付ければその bot。メールのヘッダーは見ない
+#[tokio::test]
+async fn deploy_check_sends_once_per_target_and_version() {
+    let t = tenant().await;
+    let first = bot(t, "1-first", "lineworks", true).await;
+    let second = bot(t, "2-second", "lineworks", true).await;
+    let record = Arc::new(FakeRecord::default());
+    let tid = t.to_string();
+    let app = app(Opts {
+        http: with_users(FakeLineworks::default()),
+        record: record.clone(),
+        ..Opts::default()
+    })
+    .await;
+    let me = [("X-Tenant-ID", tid.as_str()), ("X-User-Email", "z@x.com")];
+
+    let got = deploy_check(&app, &me, "to=u2").await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, deploy_reply("0123456789abcdef", "", true, "sent"))
+    );
+    let seen = app.http.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        3,
+        "token 2 回 (directory.read・bot) + 送信 1 回"
+    );
+    assert_eq!(form_value(&seen[0].body, "client_id"), first.client_id);
+    assert_eq!(app.http.token_scopes(), ["directory.read", "bot"]);
+    assert_eq!(
+        seen[2].url,
+        format!("{BOTS_URL}{}/users/u2/messages", first.bot_id)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&seen[2].body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"content": {"type": "text", "text": "alc-lineworks-worker 01234567 を本番に出しました (デプロイ確認)"}})
+    );
+    let key = |v: &str, to: &str| lineworks::deploy_check::record_key(v, t, to);
+    assert_eq!(
+        *record.versions.lock().unwrap(),
+        [key("0123456789abcdef", "u2")]
+    );
+
+    let got = deploy_check(&app, &me, "to=u2").await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            200,
+            deploy_reply("0123456789abcdef", "", false, "already_sent")
+        )
+    );
+    assert_eq!(app.http.seen.lock().unwrap().len(), 3, "2 回目は送らない");
+
+    // 別の相手 (同じ版)
+    let got = deploy_check(&app, &me, "to=u5").await;
+    assert_eq!(got.json()["reason"], "sent");
+    let seen = app.http.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.last().unwrap().url,
+        format!("{BOTS_URL}{}/users/u5/messages", first.bot_id)
+    );
+
+    // 新しい版 (同じ記録を持つ別の isolate)・bot を指定
+    let app = app_with(Opts {
+        http: with_users(FakeLineworks::default()),
+        record: record.clone(),
+        version: ("fedcba9876543210".into(), "v0.1.4".into()),
+        ..Opts::default()
+    })
+    .await;
+    let got = deploy_check(&app, &me, &format!("to=u2&bot_config_id={}", second.id)).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (
+            200,
+            deploy_reply("fedcba9876543210", "v0.1.4", true, "sent")
+        )
+    );
+    let seen = app.http.seen.lock().unwrap().clone();
+    assert_eq!(form_value(&seen[0].body, "client_id"), second.client_id);
+    assert_eq!(
+        seen[2].url,
+        format!("{BOTS_URL}{}/users/u2/messages", second.bot_id)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&seen[2].body).unwrap();
+    assert_eq!(
+        body["content"]["text"],
+        "alc-lineworks-worker v0.1.4 を本番に出しました (デプロイ確認)"
+    );
+    assert_eq!(
+        *record.versions.lock().unwrap(),
+        [
+            key("0123456789abcdef", "u2"),
+            key("0123456789abcdef", "u5"),
+            key("fedcba9876543210", "u2"),
+        ]
+    );
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// 送り先が決まらない → 200 sent=false と理由語 (記録しない・送らない・ログも出さない):
+/// 版が取れない = not_configured / tenant か `to` が無い (空も) = no_user / tenant に使える bot が無い (別 tenant の bot の指定も) =
+/// no_bot / `to` が組織のメンバーに居ない・形が崩れている = user_not_found
+#[tokio::test]
+async fn deploy_check_not_sent() {
+    let t = tenant().await;
+    let empty = tenant().await;
+    let other = tenant().await;
+    bot(t, "main", "lineworks", true).await;
+    bot(empty, "off", "lineworks", false).await;
+    let foreign = bot(other, "foreign", "lineworks", true).await;
+    let (tid, eid) = (t.to_string(), empty.to_string());
+    let tenant_of = |id: &str| vec![("X-Tenant-ID", id.to_owned())];
+    let users = || with_users(FakeLineworks::default());
+    let cases: Vec<(Opts, Headers, String, &str)> = vec![
+        (
+            Opts {
+                version: (String::new(), String::new()),
+                ..Opts::default()
+            },
+            tenant_of(&tid),
+            "to=u2".into(),
+            "not_configured",
+        ),
+        (Opts::default(), vec![], "to=u2".into(), "no_user"),
+        (Opts::default(), tenant_of(&tid), String::new(), "no_user"),
+        (Opts::default(), tenant_of(&tid), "to=".into(), "no_user"),
+        (Opts::default(), tenant_of(&eid), "to=u2".into(), "no_bot"),
+        (
+            Opts::default(),
+            tenant_of(&tid),
+            format!("to=u2&bot_config_id={}", foreign.id),
+            "no_bot",
+        ),
+        (
+            Opts {
+                http: users(),
+                ..Opts::default()
+            },
+            tenant_of(&tid),
+            "to=u9".into(),
+            "user_not_found",
+        ),
+        (
+            Opts {
+                http: users(),
+                ..Opts::default()
+            },
+            tenant_of(&tid),
+            "to=u%2F2".into(),
+            "user_not_found",
+        ),
+    ];
+    for (opts, headers, query, reason) in cases {
+        let version = opts.version.0.clone();
+        let app = app_with(opts).await;
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let got = deploy_check(&app, &headers, &query).await;
+        assert_eq!(
+            (got.status, got.json()),
+            (200, deploy_reply(&version, "", false, reason))
+        );
+        assert!(
+            app.http
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r.url == TOKEN_URL),
+            "送信はしない"
+        );
+        assert!(app.record.versions.lock().unwrap().is_empty());
+        assert!(app.logs.lock().unwrap().is_empty());
+    }
+}
+
+/// 送れない → 502 send_failed (本文は 4 つのキーだけ・識別子もエラー文も `to` も無い・ログは固定の語と段の語)。記録しないので
+/// 次の呼び出しでまた試す。組織のメンバーが取れない (権限・上流)・送信の失敗・DB の失敗・鍵が無い
+#[tokio::test]
+async fn deploy_check_send_failed() {
+    let t = tenant().await;
+    let b = bot(t, "main", "lineworks", true).await;
+    let tid = t.to_string();
+    let send_failed = deploy_reply("0123456789abcdef", "", false, "send_failed");
+    let fixed = "lineworks-deploy-check: send failed";
+    let cases: Vec<(bool, Opts, Vec<&str>)> = vec![
+        (
+            true,
+            Opts {
+                http: FakeLineworks::default().on_get(USERS_URL, 403, "", None),
+                ..Opts::default()
+            },
+            vec!["lineworks-read: Read users failed: HTTP 403", fixed],
+        ),
+        (
+            true,
+            Opts {
+                http: with_users(FakeLineworks {
+                    send_status: 500,
+                    ..FakeLineworks::default()
+                }),
+                ..Opts::default()
+            },
+            vec!["lineworks-send: Send failed: HTTP 500", fixed],
+        ),
+        (
+            false,
+            Opts::default(),
+            vec!["lineworks-send: bot config failed: db (42501)", fixed],
+        ),
+        (
+            true,
+            Opts {
+                sso_key: None,
+                ..Opts::default()
+            },
+            vec!["lineworks-send: SSO_ENCRYPTION_KEY not set", fixed],
+        ),
+    ];
+    for (rt, opts, logs) in cases {
+        let pg = if rt {
+            rt_client().await
+        } else {
+            client_as(NO_BOT_ROLE).await
+        };
+        let app = build(pg, opts);
+        let got = deploy_check(&app, &[("X-Tenant-ID", &tid)], "to=u2").await;
+        assert_eq!((got.status, got.json()), (502, send_failed.clone()));
+        assert!(!String::from_utf8_lossy(&got.body).contains("u2"));
+        assert_eq!(*app.logs.lock().unwrap(), logs);
+        assert!(app.record.versions.lock().unwrap().is_empty());
+        assert_logs_clean(&app, &[&tid, &b.bot_id, "u2"]);
     }
 }
