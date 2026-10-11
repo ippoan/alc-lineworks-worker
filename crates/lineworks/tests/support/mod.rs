@@ -251,7 +251,7 @@ pub struct Bot {
     pub client_id: String,
 }
 
-/// bot の設定を 1 つ作る。`private_key_encrypted` は鍵ではない文字列 (worker が読まないことを確かめるため)
+/// bot の設定を 1 つ作る
 pub async fn bot(tenant_id: Uuid, name: &str, provider: &str, enabled: bool) -> Bot {
     let bot_id = format!("bot-{}", Uuid::new_v4());
     let client_id = format!("client-{name}");
@@ -259,8 +259,8 @@ pub async fn bot(tenant_id: Uuid, name: &str, provider: &str, enabled: bool) -> 
         .await
         .query_one(
             "INSERT INTO alc_api.bot_configs (tenant_id, provider, name, client_id, client_secret_encrypted, \
-             service_account, private_key_encrypted, bot_id, enabled) \
-             VALUES ($1, $2, $3, $4, $5, 'sa@example', 'not-a-key-and-never-read', $6, $7) RETURNING id",
+             service_account, bot_id, enabled) \
+             VALUES ($1, $2, $3, $4, $5, 'sa@example', $6, $7) RETURNING id",
             &[
                 &tenant_id,
                 &provider,
