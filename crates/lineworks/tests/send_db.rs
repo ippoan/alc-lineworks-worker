@@ -1466,12 +1466,11 @@ fn deploy_reply(version: &str, tag: &str, sent: bool, reason: &str) -> serde_jso
     serde_json::json!({"version": version, "tag": tag, "sent": sent, "reason": reason})
 }
 
-/// 叩いた人 (proxy の `X-Tenant-ID` + `X-User-Email`) に 1 通: tenant の既定の bot (名前順の最初) で組織のメンバーを取り、
-/// メール (大文字小文字は区別しない) の一致する人の user_id へ固定文を送り、(版, tenant, メール) を記録する。
-/// 同じ版・同じ人の 2 回目は送らない。別の人はまた送る (人ごとに版 1 回)。別の版 (tag 付き) はまた送り、文は tag。
-/// `bot_config_id` を付ければその bot
+/// `?to=` の相手に版ごと 1 回: tenant (`X-Tenant-ID`) の既定の bot (名前順の最初) で組織のメンバーを取り、`to` が居れば
+/// 固定文を送り、(版, tenant, to のハッシュ) を記録する。同じ版・同じ相手の 2 回目は送らない。別の相手はまた送る。
+/// 別の版 (tag 付き) はまた送り、文は tag。`bot_config_id` を付ければその bot。メールのヘッダーは見ない
 #[tokio::test]
-async fn deploy_check_sends_once_per_user_and_version() {
+async fn deploy_check_sends_once_per_target_and_version() {
     let t = tenant().await;
     let first = bot(t, "1-first", "lineworks", true).await;
     let second = bot(t, "2-second", "lineworks", true).await;
@@ -1483,9 +1482,9 @@ async fn deploy_check_sends_once_per_user_and_version() {
         ..Opts::default()
     })
     .await;
-    let me = [("X-Tenant-ID", tid.as_str()), ("X-User-Email", "b@X.com")];
+    let me = [("X-Tenant-ID", tid.as_str()), ("X-User-Email", "z@x.com")];
 
-    let got = deploy_check(&app, &me, "").await;
+    let got = deploy_check(&app, &me, "to=u2").await;
     assert_eq!(
         (got.status, got.json()),
         (200, deploy_reply("0123456789abcdef", "", true, "sent"))
@@ -1507,13 +1506,13 @@ async fn deploy_check_sends_once_per_user_and_version() {
         body,
         serde_json::json!({"content": {"type": "text", "text": "alc-lineworks-worker 01234567 を本番に出しました (デプロイ確認)"}})
     );
-    let key = |v: &str, email: &str| lineworks::deploy_check::record_key(v, t, email);
+    let key = |v: &str, to: &str| lineworks::deploy_check::record_key(v, t, to);
     assert_eq!(
         *record.versions.lock().unwrap(),
-        [key("0123456789abcdef", "b@x.com")]
+        [key("0123456789abcdef", "u2")]
     );
 
-    let got = deploy_check(&app, &me, "").await;
+    let got = deploy_check(&app, &me, "to=u2").await;
     assert_eq!(
         (got.status, got.json()),
         (
@@ -1523,18 +1522,13 @@ async fn deploy_check_sends_once_per_user_and_version() {
     );
     assert_eq!(app.http.seen.lock().unwrap().len(), 3, "2 回目は送らない");
 
-    // 別の人 (同じ版)
-    let got = deploy_check(
-        &app,
-        &[("X-Tenant-ID", &tid), ("X-User-Email", "a@x.com")],
-        "",
-    )
-    .await;
+    // 別の相手 (同じ版)
+    let got = deploy_check(&app, &me, "to=u5").await;
     assert_eq!(got.json()["reason"], "sent");
     let seen = app.http.seen.lock().unwrap().clone();
     assert_eq!(
         seen.last().unwrap().url,
-        format!("{BOTS_URL}{}/users/u1/messages", first.bot_id)
+        format!("{BOTS_URL}{}/users/u5/messages", first.bot_id)
     );
 
     // 新しい版 (同じ記録を持つ別の isolate)・bot を指定
@@ -1545,7 +1539,7 @@ async fn deploy_check_sends_once_per_user_and_version() {
         ..Opts::default()
     })
     .await;
-    let got = deploy_check(&app, &me, &format!("bot_config_id={}", second.id)).await;
+    let got = deploy_check(&app, &me, &format!("to=u2&bot_config_id={}", second.id)).await;
     assert_eq!(
         (got.status, got.json()),
         (
@@ -1567,17 +1561,17 @@ async fn deploy_check_sends_once_per_user_and_version() {
     assert_eq!(
         *record.versions.lock().unwrap(),
         [
-            key("0123456789abcdef", "b@x.com"),
-            key("0123456789abcdef", "a@x.com"),
-            key("fedcba9876543210", "b@x.com"),
+            key("0123456789abcdef", "u2"),
+            key("0123456789abcdef", "u5"),
+            key("fedcba9876543210", "u2"),
         ]
     );
     assert!(app.logs.lock().unwrap().is_empty());
 }
 
-/// 送り先が決まらない → 200 sent=false と理由語 (記録しない・ログも出さない):
-/// 版が取れない = not_configured / ヘッダーが無い = no_user / tenant に使える bot が無い (別 tenant の bot の指定も) = no_bot /
-/// 組織にメールの一致する人が居ない・user_id が path を崩す = user_not_found
+/// 送り先が決まらない → 200 sent=false と理由語 (記録しない・送らない・ログも出さない):
+/// 版が取れない = not_configured / tenant か `to` が無い (空も) = no_user / tenant に使える bot が無い (別 tenant の bot の指定も) =
+/// no_bot / `to` が組織のメンバーに居ない・形が崩れている = user_not_found
 #[tokio::test]
 async fn deploy_check_not_sent() {
     let t = tenant().await;
@@ -1587,61 +1581,44 @@ async fn deploy_check_not_sent() {
     bot(empty, "off", "lineworks", false).await;
     let foreign = bot(other, "foreign", "lineworks", true).await;
     let (tid, eid) = (t.to_string(), empty.to_string());
-    let me = |tenant: &str| {
-        vec![
-            ("X-Tenant-ID", tenant.to_owned()),
-            ("X-User-Email", "b@x.com".to_owned()),
-        ]
-    };
-    let odd_users = FakeLineworks::default().on_get(
-        USERS_URL,
-        200,
-        r#"{"users":[{"userId":"u/2","email":"b@x.com"}],"responseMetaData":{}}"#,
-        None,
-    );
+    let tenant_of = |id: &str| vec![("X-Tenant-ID", id.to_owned())];
+    let users = || with_users(FakeLineworks::default());
     let cases: Vec<(Opts, Headers, String, &str)> = vec![
         (
             Opts {
                 version: (String::new(), String::new()),
                 ..Opts::default()
             },
-            me(&tid),
-            String::new(),
+            tenant_of(&tid),
+            "to=u2".into(),
             "not_configured",
         ),
-        (Opts::default(), vec![], String::new(), "no_user"),
+        (Opts::default(), vec![], "to=u2".into(), "no_user"),
+        (Opts::default(), tenant_of(&tid), String::new(), "no_user"),
+        (Opts::default(), tenant_of(&tid), "to=".into(), "no_user"),
+        (Opts::default(), tenant_of(&eid), "to=u2".into(), "no_bot"),
         (
             Opts::default(),
-            vec![("X-Tenant-ID", tid.clone())],
-            String::new(),
-            "no_user",
-        ),
-        (Opts::default(), me(&eid), String::new(), "no_bot"),
-        (
-            Opts::default(),
-            me(&tid),
-            format!("bot_config_id={}", foreign.id),
+            tenant_of(&tid),
+            format!("to=u2&bot_config_id={}", foreign.id),
             "no_bot",
         ),
         (
             Opts {
-                http: with_users(FakeLineworks::default()),
+                http: users(),
                 ..Opts::default()
             },
-            vec![
-                ("X-Tenant-ID", tid.clone()),
-                ("X-User-Email", "z@x.com".into()),
-            ],
-            String::new(),
+            tenant_of(&tid),
+            "to=u9".into(),
             "user_not_found",
         ),
         (
             Opts {
-                http: odd_users,
+                http: users(),
                 ..Opts::default()
             },
-            me(&tid),
-            String::new(),
+            tenant_of(&tid),
+            "to=u%2F2".into(),
             "user_not_found",
         ),
     ];
@@ -1668,7 +1645,7 @@ async fn deploy_check_not_sent() {
     }
 }
 
-/// 送れない → 502 send_failed (本文は 4 つのキーだけ・識別子もエラー文も無い・ログは固定の語と段の語)。記録しないので
+/// 送れない → 502 send_failed (本文は 4 つのキーだけ・識別子もエラー文も `to` も無い・ログは固定の語と段の語)。記録しないので
 /// 次の呼び出しでまた試す。組織のメンバーが取れない (権限・上流)・送信の失敗・DB の失敗・鍵が無い
 #[tokio::test]
 async fn deploy_check_send_failed() {
@@ -1718,15 +1695,11 @@ async fn deploy_check_send_failed() {
             client_as(NO_BOT_ROLE).await
         };
         let app = build(pg, opts);
-        let got = deploy_check(
-            &app,
-            &[("X-Tenant-ID", &tid), ("X-User-Email", "b@x.com")],
-            "",
-        )
-        .await;
+        let got = deploy_check(&app, &[("X-Tenant-ID", &tid)], "to=u2").await;
         assert_eq!((got.status, got.json()), (502, send_failed.clone()));
+        assert!(!String::from_utf8_lossy(&got.body).contains("u2"));
         assert_eq!(*app.logs.lock().unwrap(), logs);
         assert!(app.record.versions.lock().unwrap().is_empty());
-        assert_logs_clean(&app, &[&tid, &b.bot_id, "b@x.com", "u2"]);
+        assert_logs_clean(&app, &[&tid, &b.bot_id, "u2"]);
     }
 }

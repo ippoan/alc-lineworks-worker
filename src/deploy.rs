@@ -1,5 +1,5 @@
 //! デプロイの確認の口の「この版でもう送った」の記録 ([`SentRecord`]) の Workers での実装。
-//! Cache API の `caches.default` に、鍵 (版・tenant・メールの 16 進 = `lineworks::deploy_check::record_key`) ごとに 1 件を置く (KV・DB は使わない)。
+//! Cache API の `caches.default` に、鍵 (版・tenant・送り先の SHA-256 = `lineworks::deploy_check::record_key`) ごとに 1 件を置く (KV・DB は使わない)。
 //! colo ごとの記録なので、別の colo から叩けば 2 通目が出得る (許容)。読めない・書けないは「送っていない」扱い。
 //!
 //! JS の値で `Send` でないので `SendFuture` で包む (src/http.rs と同じ)。wasm 専用で、CI のテストと coverage の gate の外。

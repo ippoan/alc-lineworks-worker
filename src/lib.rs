@@ -8,8 +8,8 @@
 //! 秘密値は Secrets Store から、6 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
 //! `LINEWORKS_PRIVATE_KEY` (JWT の署名。全 bot で共有する 1 本)。LINE WORKS の access token は isolate の中で使い回す。
 //!
-//! デプロイの確認の口 (`GET /api/lineworks/deploy-check`) の送り先は、auth-worker の browser proxy が付ける
-//! `X-Tenant-ID`・`X-User-Email` の本人 (secret は増やさない)。「この版でもう送った」の記録は Cache API の
+//! デプロイの確認の口 (`GET /api/lineworks/deploy-check?to=`) の送り先は query の `to` (tenant は auth-worker の
+//! browser proxy が付ける `X-Tenant-ID`。secret は増やさない)。「この版でもう送った」の記録は Cache API の
 //! `caches.default` ([`deploy::CacheRecord`])。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、

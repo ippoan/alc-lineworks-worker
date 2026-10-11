@@ -1,8 +1,8 @@
 # alc-lineworks-worker
 
 LINE WORKS の Worker `alc-lineworks` (Refs ohishi-exp/rust-leave-worker#1)。型は rust-leave-worker・alc-dtako-worker と同じ。
-口は 6 つ: `POST /api/internal/lineworks/send` (rust-alc-api と同じ契約。recipient 宛は `bot_config_id` で bot を指定でき、使えない指定は 400 で名前順に戻さない)・`POST /api/internal/lineworks/token` (auth-worker 向けの access token)・`POST /api/internal/lineworks/messages` (notify / trouble の worker 向け。tenant 指定で text / image を user / channel へ)・`GET /api/internal/lineworks/users` (組織のメンバー)・`GET /api/internal/lineworks/login-activity` (ログイン状況の集計。audit.read は worker の中だけで使い、token の口では出さない)・`GET /api/lineworks/deploy-check` (本番デプロイの確認。版が変わったら叩いた人へ固定文を 1 通だけ送る。記録は Cache API)。
-本番デプロイ後は親が auth-worker の verify_eval でこの GET を叩く。送り先は叩いた人本人 (browser proxy の `X-Tenant-ID`・`X-User-Email` → 組織のメンバーのメールで LINE WORKS の user_id)。secret は使わない (増やさない)。
+口は 6 つ: `POST /api/internal/lineworks/send` (rust-alc-api と同じ契約。recipient 宛は `bot_config_id` で bot を指定でき、使えない指定は 400 で名前順に戻さない)・`POST /api/internal/lineworks/token` (auth-worker 向けの access token)・`POST /api/internal/lineworks/messages` (notify / trouble の worker 向け。tenant 指定で text / image を user / channel へ)・`GET /api/internal/lineworks/users` (組織のメンバー)・`GET /api/internal/lineworks/login-activity` (ログイン状況の集計。audit.read は worker の中だけで使い、token の口では出さない)・`GET /api/lineworks/deploy-check` (本番デプロイの確認。`?to=` の相手に、版ごと 1 回だけ固定文を送る。記録は Cache API)。
+本番デプロイ後は親が auth-worker の verify_eval でこの GET を叩く。送り先は `?to=<LINE WORKS の user_id>` (その tenant = browser proxy の `X-Tenant-ID` の組織のメンバーに居る人だけ。`to` は応答・ログに出さない)。secret は使わない (増やさない)。
 直下 = Worker (wasm 専用)、`crates/lineworks/` = 口・SQL・JWT の claim・LINE WORKS の呼び方。
 復号 (`decrypt_secret`) と RS256 の署名 (`sign_rs256`) は kit の `alc-worker-crypto` を使う (この repo に写しを置かない)。詳細は `README.md`。
 
