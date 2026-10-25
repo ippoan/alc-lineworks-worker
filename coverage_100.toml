@@ -33,3 +33,8 @@ path = "crates/lineworks/src/activity.rs"
 # 本番デプロイの確認の口 (版が変わったら 1 通だけ送る。tests/send_db.rs が口から通す)
 [[files]]
 path = "crates/lineworks/src/deploy_check.rs"
+
+# Bot 設定の管理の口 (rust-alc-api の /api/admin/bot/configs から移植。401 / 403 / 400 / 404 / 409 / 500 / 200 / 204。
+# tests/send_db.rs と単体テストが通す。Refs ippoan/rust-alc-api#680)
+[[files]]
+path = "crates/lineworks/src/bot_admin.rs"

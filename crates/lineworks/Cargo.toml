@@ -15,8 +15,8 @@ alc-core-wasm = { workspace = true }
 alc-worker-crypto = { workspace = true }
 alc-worker-db = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
-# 監査ログ・掲示板の日時 (時計は使わない。「今」は呼び手から渡す)
-chrono = { version = "0.4", default-features = false, features = ["alloc", "std"] }
+# 監査ログ・掲示板の日時 (時計は使わない。「今」は呼び手から渡す)・Bot 設定の created_at / updated_at
+chrono = { version = "0.4", default-features = false, features = ["alloc", "std", "serde"] }
 # 監査ログの CSV (rust-alc-api の parse_login_audit_csv と同じ読み方)。pure Rust
 csv = "1"
 # 監査ログの CSV が UTF-8 でないときの Shift_JIS (rust の decode_csv_bytes と同じ)
@@ -27,7 +27,7 @@ serde_json = "1"
 # deploy-check の記録の鍵 (送り先を SHA-256 にして識別子の形のまま置かない)。pure Rust
 sha2 = { version = "0.10", default-features = false }
 # 型付きの文の型 (`Type`)。接続は張らない (wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
-tokio-postgres = { version = "0.7", default-features = false, features = ["with-uuid-1"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["with-uuid-1", "with-chrono-0_4"] }
 uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]

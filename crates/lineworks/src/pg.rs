@@ -196,3 +196,193 @@ pub async fn lineworks_bot_config_by_id(
         .await?;
     Ok(row.map(bot_row))
 }
+
+// ---------- Bot 設定の管理 (rust-alc-api の /api/admin/bot/configs から移した。Refs ippoan/rust-alc-api#680) ----------
+//
+// すべてその会社の transaction で、WHERE / VALUES に tenant_id を明示する (移植元の一覧・更新・削除は WHERE に
+// tenant_id が無く RLS 任せだった)。秘密値は暗号文で受けて保存するだけ (暗号化は呼び手の [`crate::bot_admin`])。
+
+pub mod admin_sql {
+    /// 一覧で返す列 (秘密値の列は読まない)
+    macro_rules! bot_admin_columns {
+        () => {
+            "id, provider, name, client_id, service_account, bot_id, enabled, created_at, updated_at"
+        };
+    }
+
+    pub const LIST: &str = concat!(
+        "SELECT ",
+        bot_admin_columns!(),
+        " FROM alc_api.bot_configs WHERE tenant_id = $1 ORDER BY name, id"
+    );
+
+    pub const INSERT: &str = concat!(
+        "INSERT INTO alc_api.bot_configs \
+         (tenant_id, provider, name, client_id, client_secret_encrypted, service_account, bot_id, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ",
+        bot_admin_columns!()
+    );
+
+    pub const UPDATE: &str = concat!(
+        "UPDATE alc_api.bot_configs SET provider = $3, name = $4, client_id = $5, \
+         service_account = $6, bot_id = $7, enabled = $8, updated_at = NOW() \
+         WHERE tenant_id = $1 AND id = $2 RETURNING ",
+        bot_admin_columns!()
+    );
+
+    pub const UPDATE_CLIENT_SECRET: &str = "UPDATE alc_api.bot_configs \
+         SET client_secret_encrypted = $3 WHERE tenant_id = $1 AND id = $2";
+
+    pub const UPDATE_BOT_SECRET: &str = "UPDATE alc_api.bot_configs \
+         SET bot_secret_encrypted = $3 WHERE tenant_id = $1 AND id = $2";
+
+    pub const DELETE: &str = "DELETE FROM alc_api.bot_configs WHERE tenant_id = $1 AND id = $2";
+}
+
+/// Bot 設定の 1 行 (移植元の `BotConfigResponse` と同じ形。秘密値は持たない)
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BotAdminRow {
+    pub id: Uuid,
+    pub provider: String,
+    pub name: String,
+    pub client_id: String,
+    pub service_account: String,
+    pub bot_id: String,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl alc_worker_db::TxOutput for BotAdminRow {}
+
+fn bot_admin_row(r: &tokio_postgres::Row) -> BotAdminRow {
+    BotAdminRow {
+        id: r.get(0),
+        provider: r.get(1),
+        name: r.get(2),
+        client_id: r.get(3),
+        service_account: r.get(4),
+        bot_id: r.get(5),
+        enabled: r.get(6),
+        created_at: r.get(7),
+        updated_at: r.get(8),
+    }
+}
+
+/// Bot 設定の保存の入力。`id` が在れば更新、無ければ作成。秘密値は暗号文 (`None` なら変えない)
+#[derive(Debug, Clone, PartialEq)]
+pub struct BotAdminInput {
+    pub id: Option<Uuid>,
+    pub provider: String,
+    pub name: String,
+    pub client_id: String,
+    pub service_account: String,
+    pub bot_id: String,
+    pub enabled: bool,
+    pub client_secret_encrypted: Option<String>,
+    pub bot_secret_encrypted: Option<String>,
+}
+
+pub async fn bot_admin_list(pg: &mut PgClient, tenant_id: Uuid) -> Result<Vec<BotAdminRow>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(admin_sql::LIST, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(bot_admin_row).collect())
+        })
+    })
+    .await
+}
+
+/// 作成 / 更新と秘密値の差し替えを 1 つの transaction で。更新の対象がその会社に無ければ `None`
+pub async fn bot_admin_save(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    b: BotAdminInput,
+) -> Result<Option<BotAdminRow>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = match b.id {
+                Some(id) => {
+                    let Some(row) = tx
+                        .query_typed_opt(
+                            admin_sql::UPDATE,
+                            &[
+                                (&tenant_id, Type::UUID),
+                                (&id, Type::UUID),
+                                (&b.provider, Type::TEXT),
+                                (&b.name, Type::TEXT),
+                                (&b.client_id, Type::TEXT),
+                                (&b.service_account, Type::TEXT),
+                                (&b.bot_id, Type::TEXT),
+                                (&b.enabled, Type::BOOL),
+                            ],
+                        )
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    if let Some(secret) = &b.client_secret_encrypted {
+                        tx.execute_typed(
+                            admin_sql::UPDATE_CLIENT_SECRET,
+                            &[
+                                (&tenant_id, Type::UUID),
+                                (&id, Type::UUID),
+                                (secret, Type::TEXT),
+                            ],
+                        )
+                        .await?;
+                    }
+                    row
+                }
+                None => {
+                    // 移植元と同じく、作成で client secret が無ければ空文字の暗号文 (呼び手が作る) を入れる
+                    let secret = b.client_secret_encrypted.clone().unwrap_or_default();
+                    tx.query_typed_one(
+                        admin_sql::INSERT,
+                        &[
+                            (&tenant_id, Type::UUID),
+                            (&b.provider, Type::TEXT),
+                            (&b.name, Type::TEXT),
+                            (&b.client_id, Type::TEXT),
+                            (&secret, Type::TEXT),
+                            (&b.service_account, Type::TEXT),
+                            (&b.bot_id, Type::TEXT),
+                            (&b.enabled, Type::BOOL),
+                        ],
+                    )
+                    .await?
+                }
+            };
+            let saved = bot_admin_row(&row);
+            if let Some(secret) = &b.bot_secret_encrypted {
+                tx.execute_typed(
+                    admin_sql::UPDATE_BOT_SECRET,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&saved.id, Type::UUID),
+                        (secret, Type::TEXT),
+                    ],
+                )
+                .await?;
+            }
+            Ok(Some(saved))
+        })
+    })
+    .await
+}
+
+/// その会社の Bot 設定を消す。消えた行数 (無い・他社は 0)
+pub async fn bot_admin_delete(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Result<u64, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                admin_sql::DELETE,
+                &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+            )
+            .await
+        })
+    })
+    .await
+}

@@ -113,6 +113,7 @@ pub fn router() -> Router<SendState> {
         .route(SEND_PATH, post(send_text))
         .route(DEPLOY_CHECK_PATH, get(deploy_check::deploy_check))
         .merge(tenant)
+        .merge(crate::bot_admin::bot_admin_router())
 }
 
 #[derive(Debug, Deserialize)]
