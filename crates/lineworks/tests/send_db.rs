@@ -1716,12 +1716,23 @@ async fn bot_admin(
     role: Option<&str>,
     body: Option<serde_json::Value>,
 ) -> Got {
+    bot_admin_at(app, BOT_CONFIGS, method, tenant, role, body).await
+}
+
+async fn bot_admin_at(
+    app: &App,
+    uri: &str,
+    method: &str,
+    tenant: Option<Uuid>,
+    role: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> Got {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
     let mut b = Request::builder()
         .method(method)
-        .uri(BOT_CONFIGS)
+        .uri(uri)
         .header("content-type", "application/json");
     if let Some(t) = tenant {
         b = b.header("X-Tenant-ID", t.to_string());
@@ -2004,4 +2015,54 @@ async fn bot_admin_db_failure_is_500() {
 
 fn decrypt(enc: &str) -> String {
     alc_worker_crypto::secret::decrypt_secret(enc, SSO_KEY).unwrap()
+}
+
+/// nuxt-leave の形の削除 `DELETE /api/admin/bot/configs/{id}`: 他社の id は消さず、自分の会社の id を消す (無くても 204)。
+/// 管理者だけ・id の形
+#[tokio::test]
+async fn bot_admin_delete_by_path() {
+    let app = app(Opts::default()).await;
+    let (t, other) = (tenant().await, tenant().await);
+    let b = bot(t, "by-path", "lineworks", true).await;
+    let path = format!("{BOT_CONFIGS}/{}", b.id);
+    assert_eq!(
+        bot_admin_at(&app, &path, "DELETE", Some(t), Some("viewer"), None)
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        bot_admin_at(&app, &path, "DELETE", Some(other), Some("admin"), None)
+            .await
+            .status,
+        204
+    );
+    let count = || async {
+        let n: i64 = admin()
+            .await
+            .query_one(
+                "SELECT count(*) FROM alc_api.bot_configs WHERE id = $1",
+                &[&b.id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        n
+    };
+    assert_eq!(count().await, 1, "他社からは消えない");
+    let got = bot_admin_at(&app, &path, "DELETE", Some(t), Some("admin"), None).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    assert_eq!(count().await, 0);
+    let got = bot_admin_at(
+        &app,
+        &format!("{BOT_CONFIGS}/x"),
+        "DELETE",
+        Some(t),
+        Some("admin"),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json()["error"], "invalid_id");
 }

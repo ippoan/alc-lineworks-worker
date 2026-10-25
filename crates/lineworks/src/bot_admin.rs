@@ -9,6 +9,7 @@
 //! | GET | `/api/admin/bot/configs` | 200 `{configs:[{id,provider,name,client_id,service_account,bot_id,enabled,created_at,updated_at}]}` (名前の順) |
 //! | POST | `/api/admin/bot/configs` | 200 設定の 1 行 (`id` が在れば更新、無ければ作成) / 400 `invalid_body`・`invalid_id` / 404 `bot_config_not_found` / 409 `bot_config_conflict` (同じ provider・bot_id が在る) |
 //! | DELETE | `/api/admin/bot/configs` | 204 (body `{id}`。無くても) / 400 `invalid_body`・`invalid_id` |
+//! | DELETE | `/api/admin/bot/configs/{id}` | 204 (無くても) / 400 `invalid_id`。nuxt-leave がこの形で呼ぶ (移植元には無く、本番では削除が通っていなかった) |
 //!
 //! - tenant は `X-Tenant-ID` (無い・UUID でない → 401)。**管理者 (`X-User-Role: admin`) だけ** (それ以外・identity が
 //!   揃わない → 403 `forbidden`)
@@ -22,9 +23,9 @@ use alc_core_wasm::api_error::{bad_request, internal_error_msg, not_found, ApiEr
 use alc_core_wasm::{require_tenant_header, AuthUser, TenantId};
 use alc_worker_crypto::secret::encrypt_secret;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{middleware, Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,6 +36,7 @@ use crate::pg::{self, BotAdminInput, BotAdminRow};
 use crate::routes::SendState;
 
 pub const BOT_CONFIGS_PATH: &str = "/api/admin/bot/configs";
+pub const BOT_CONFIG_PATH: &str = "/api/admin/bot/configs/{id}";
 
 pub fn bot_admin_router() -> Router<SendState> {
     Router::new()
@@ -42,6 +44,7 @@ pub fn bot_admin_router() -> Router<SendState> {
             BOT_CONFIGS_PATH,
             get(list_configs).post(save_config).delete(delete_config),
         )
+        .route(BOT_CONFIG_PATH, delete(delete_config_by_path))
         .route_layer(middleware::from_fn(require_tenant_header))
 }
 
@@ -166,7 +169,21 @@ async fn delete_config(
 ) -> Result<StatusCode, ApiError> {
     require_admin(user.as_deref())?;
     let Json(b) = body.map_err(|_| invalid_body())?;
-    let id = parse_id(&b.id)?;
+    delete_one(&state, tenant_id, parse_id(&b.id)?).await
+}
+
+async fn delete_config_by_path(
+    State(state): State<SendState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    user: Option<Extension<AuthUser>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(user.as_deref())?;
+    delete_one(&state, tenant_id, parse_id(&id)?).await
+}
+
+/// その会社の Bot 設定を消す (無くても 204)
+async fn delete_one(state: &SendState, tenant_id: Uuid, id: Uuid) -> Result<StatusCode, ApiError> {
     pg::bot_admin_delete(&mut *state.pg.lock().await, tenant_id, id)
         .await
         .map_err(|e| state.admin_db_error("delete", &e))?;
