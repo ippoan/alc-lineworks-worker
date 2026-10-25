@@ -13,6 +13,7 @@
 //! - [`deploy_check`] — 本番デプロイの確認の口 `GET /api/lineworks/deploy-check` (版が変わったら 1 通だけ送る)
 
 pub mod activity;
+pub mod bot_admin;
 pub mod client;
 pub mod deploy_check;
 pub mod jwt;

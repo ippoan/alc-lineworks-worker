@@ -1703,3 +1703,305 @@ async fn deploy_check_send_failed() {
         assert_logs_clean(&app, &[&tid, &b.bot_id, "u2"]);
     }
 }
+
+// ---------- Bot 設定の管理の口 (Refs ippoan/rust-alc-api#680) ----------
+
+const BOT_CONFIGS: &str = "/api/admin/bot/configs";
+
+/// proxy が付け直すヘッダー付きで Bot 設定の口を打つ (`role` が `None` なら `X-User-*` を付けない)
+async fn bot_admin(
+    app: &App,
+    method: &str,
+    tenant: Option<Uuid>,
+    role: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> Got {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    let mut b = Request::builder()
+        .method(method)
+        .uri(BOT_CONFIGS)
+        .header("content-type", "application/json");
+    if let Some(t) = tenant {
+        b = b.header("X-Tenant-ID", t.to_string());
+    }
+    if let Some(r) = role {
+        b = b
+            .header("X-User-ID", Uuid::new_v4().to_string())
+            .header("X-User-Email", "admin@example.test")
+            .header("X-User-Role", r);
+    }
+    let body = body.map_or_else(Vec::new, |v| serde_json::to_vec(&v).unwrap());
+    let resp = app
+        .router
+        .clone()
+        .oneshot(b.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Got { status, body }
+}
+
+async fn secrets_of(id: &str) -> (String, Option<String>) {
+    let row = admin()
+        .await
+        .query_one(
+            "SELECT client_secret_encrypted, bot_secret_encrypted FROM alc_api.bot_configs WHERE id = $1",
+            &[&Uuid::parse_str(id).unwrap()],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+fn bot_body(name: &str) -> serde_json::Value {
+    let u = Uuid::new_v4();
+    serde_json::json!({
+        "name": name,
+        "client_id": format!("cid-{name}-{u}"),
+        "client_secret": "plain-client-secret",
+        "service_account": "sa@example",
+        "bot_id": format!("bot-{name}-{u}"),
+        "bot_secret": "plain-bot-secret",
+    })
+}
+
+/// 作成 → 一覧 → 更新 (秘密値は空なら変えない) → 削除。秘密値は暗号化して保存し、応答に載せない
+#[tokio::test]
+async fn bot_admin_create_list_update_delete() {
+    let app = app(Opts::default()).await;
+    let (t, other) = (tenant().await, tenant().await);
+
+    let got = bot_admin(&app, "POST", Some(t), Some("admin"), Some(bot_body("b"))).await;
+    assert_eq!(got.status, 200);
+    let row = got.json();
+    let mut keys: Vec<_> = row.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "bot_id",
+            "client_id",
+            "created_at",
+            "enabled",
+            "id",
+            "name",
+            "provider",
+            "service_account",
+            "updated_at"
+        ]
+    );
+    assert_eq!(row["provider"], "lineworks");
+    assert_eq!(row["enabled"], true);
+    assert!(
+        !got.body.windows(5).any(|w| w == b"plain"),
+        "秘密値を返さない"
+    );
+    let id = row["id"].as_str().unwrap().to_owned();
+    let (cs, bs) = secrets_of(&id).await;
+    assert_eq!(decrypt(&cs), "plain-client-secret");
+    assert_eq!(decrypt(bs.as_deref().unwrap()), "plain-bot-secret");
+
+    // 一覧は自分の会社の行だけ (名前の順)
+    bot(t, "a-first", "lineworks", true).await;
+    bot(other, "z-other", "lineworks", true).await;
+    let list = bot_admin(&app, "GET", Some(t), Some("admin"), None).await;
+    assert_eq!(list.status, 200);
+    let names: Vec<_> = list.json()["configs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["a-first", "b"]);
+
+    // 更新: 秘密値が空なら変えない
+    let mut upd = bot_body("b2");
+    upd["id"] = serde_json::json!(id);
+    upd["client_secret"] = serde_json::json!("");
+    upd["bot_secret"] = serde_json::Value::Null;
+    upd["enabled"] = serde_json::json!(false);
+    let got = bot_admin(&app, "POST", Some(t), Some("admin"), Some(upd.clone())).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["name"], "b2");
+    assert_eq!(got.json()["enabled"], false);
+    assert_eq!(secrets_of(&id).await, (cs.clone(), bs.clone()));
+    // 秘密値付きの更新は差し替える
+    upd["client_secret"] = serde_json::json!("new-client");
+    upd["bot_secret"] = serde_json::json!("new-bot");
+    assert_eq!(
+        bot_admin(&app, "POST", Some(t), Some("admin"), Some(upd.clone()))
+            .await
+            .status,
+        200
+    );
+    let (cs2, bs2) = secrets_of(&id).await;
+    assert_eq!(decrypt(&cs2), "new-client");
+    assert_eq!(decrypt(&bs2.unwrap()), "new-bot");
+
+    // 他社の path (tenant) からは更新も削除もできない
+    let got = bot_admin(&app, "POST", Some(other), Some("admin"), Some(upd)).await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json()["error"], "bot_config_not_found");
+    let del = serde_json::json!({ "id": id });
+    assert_eq!(
+        bot_admin(
+            &app,
+            "DELETE",
+            Some(other),
+            Some("admin"),
+            Some(del.clone())
+        )
+        .await
+        .status,
+        204
+    );
+    assert_eq!(secrets_of(&id).await.0, cs2, "他社からは消えない");
+    // 自分の会社から消す (無くても 204)
+    let got = bot_admin(&app, "DELETE", Some(t), Some("admin"), Some(del.clone())).await;
+    assert_eq!(got.status, 204);
+    assert!(got.body.is_empty());
+    let n: i64 = admin()
+        .await
+        .query_one(
+            "SELECT count(*) FROM alc_api.bot_configs WHERE id = $1",
+            &[&Uuid::parse_str(&id).unwrap()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0);
+    assert_eq!(
+        bot_admin(&app, "DELETE", Some(t), Some("admin"), Some(del))
+            .await
+            .status,
+        204
+    );
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// 作成で client secret が無ければ空文字の暗号文 (移植元と同じ)、bot secret は NULL のまま。provider・enabled を受ける
+#[tokio::test]
+async fn bot_admin_create_without_secrets() {
+    let app = app(Opts::default()).await;
+    let t = tenant().await;
+    let mut b = bot_body("n");
+    b["client_secret"] = serde_json::Value::Null;
+    b["bot_secret"] = serde_json::json!("");
+    b["provider"] = serde_json::json!("lineworks");
+    b["enabled"] = serde_json::json!(false);
+    let got = bot_admin(&app, "POST", Some(t), Some("admin"), Some(b)).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["enabled"], false);
+    let (cs, bs) = secrets_of(got.json()["id"].as_str().unwrap()).await;
+    assert_eq!(decrypt(&cs), "");
+    assert_eq!(bs, None);
+
+    // 同じ provider・bot_id は会社をまたいで 409 (行は作らない)
+    let other = tenant().await;
+    let mut dup = bot_body("dup");
+    dup["bot_id"] = got.json()["bot_id"].clone();
+    let res = bot_admin(&app, "POST", Some(other), Some("admin"), Some(dup)).await;
+    assert_eq!(res.status, 409);
+    assert_eq!(
+        res.json(),
+        serde_json::json!({ "error": "bot_config_conflict" })
+    );
+    let list = bot_admin(&app, "GET", Some(other), Some("admin"), None).await;
+    assert_eq!(list.json(), serde_json::json!({ "configs": [] }));
+}
+
+/// tenant 無しは 401、管理者でない・identity が無いは 403、形の違う body・id は 400、鍵が無ければ 500
+#[tokio::test]
+async fn bot_admin_rejections() {
+    let app = app(Opts::default()).await;
+    let t = tenant().await;
+    for method in ["GET", "POST", "DELETE"] {
+        assert_eq!(
+            bot_admin(&app, method, None, Some("admin"), None)
+                .await
+                .status,
+            401,
+            "{method}"
+        );
+        for role in [Some("viewer"), None] {
+            let got = bot_admin(&app, method, Some(t), role, Some(bot_body("x"))).await;
+            assert_eq!(got.status, 403, "{method} {role:?}");
+            assert_eq!(got.json(), serde_json::json!({ "error": "forbidden" }));
+        }
+    }
+    for (method, body, code) in [
+        ("POST", serde_json::json!({ "name": "x" }), "invalid_body"),
+        (
+            "POST",
+            {
+                let mut b = bot_body("x");
+                b["id"] = serde_json::json!("x");
+                b
+            },
+            "invalid_id",
+        ),
+        ("DELETE", serde_json::json!({}), "invalid_body"),
+        ("DELETE", serde_json::json!({ "id": "x" }), "invalid_id"),
+    ] {
+        let got = bot_admin(&app, method, Some(t), Some("admin"), Some(body.clone())).await;
+        assert_eq!(got.status, 400, "{method} {body}");
+        assert_eq!(got.json()["error"], code, "{method} {body}");
+    }
+    let no_key = app_with_key(None).await;
+    let got = bot_admin(&no_key, "POST", Some(t), Some("admin"), Some(bot_body("x"))).await;
+    assert_eq!(got.status, 500);
+    assert_eq!(
+        got.json(),
+        serde_json::json!({"error": "internal_error", "message": "encryption_key_missing"})
+    );
+    assert_eq!(
+        *no_key.logs.lock().unwrap(),
+        ["bot-admin: SSO_ENCRYPTION_KEY not set"]
+    );
+}
+
+async fn app_with_key(key: Option<&'static str>) -> App {
+    app(Opts {
+        sso_key: key,
+        ..Opts::default()
+    })
+    .await
+}
+
+/// DB の失敗は 500 `bot_config_failed` で、ログは段と kind だけ
+#[tokio::test]
+async fn bot_admin_db_failure_is_500() {
+    let app = build(broken_client().await, Opts::default());
+    let t = Uuid::new_v4();
+    for (method, body) in [
+        ("GET", None),
+        ("POST", Some(bot_body("x"))),
+        ("DELETE", Some(serde_json::json!({ "id": Uuid::new_v4() }))),
+    ] {
+        let got = bot_admin(&app, method, Some(t), Some("admin"), body).await;
+        assert_eq!(got.status, 500, "{method}");
+        assert_eq!(
+            got.json(),
+            serde_json::json!({"error": "internal_error", "message": "bot_config_failed"}),
+            "{method}"
+        );
+    }
+    let logs = app.logs.lock().unwrap().clone();
+    assert_eq!(logs.len(), 3);
+    for (log, stage) in logs.iter().zip(["list", "save", "delete"]) {
+        assert!(
+            log.starts_with(&format!("bot-admin: {stage} failed: db (")),
+            "{log}"
+        );
+    }
+}
+
+fn decrypt(enc: &str) -> String {
+    alc_worker_crypto::secret::decrypt_secret(enc, SSO_KEY).unwrap()
+}
