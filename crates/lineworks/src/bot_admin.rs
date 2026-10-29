@@ -10,14 +10,18 @@
 //! | POST | `/api/admin/bot/configs` | 200 設定の 1 行 (`id` が在れば更新、無ければ作成) / 400 `invalid_body`・`invalid_id` / 404 `bot_config_not_found` / 409 `bot_config_conflict` (同じ provider・bot_id が在る) |
 //! | DELETE | `/api/admin/bot/configs` | 204 (body `{id}`。無くても) / 400 `invalid_body`・`invalid_id` |
 //! | DELETE | `/api/admin/bot/configs/{id}` | 204 (無くても) / 400 `invalid_id`。nuxt-leave がこの形で呼ぶ (移植元には無く、本番では削除が通っていなかった) |
+//! | GET | `/api/admin/bot/configs/export` | 200 `{version:1,exported_at,tenant_id,data:{tenant,bot_configs,…}}` (秘密値は暗号文のまま) / 404 `tenant_not_found` |
 //!
-//! - tenant は `X-Tenant-ID` (無い・UUID でない → 401)。**管理者 (`X-User-Role: admin`) だけ** (それ以外・identity が
+//! - tenant は `X-Tenant-ID` (無い・UUID でない → 401)。一覧・保存・削除は **管理者 (`X-User-Role: admin`) だけ** (それ以外・identity が
 //!   揃わない → 403 `forbidden`)
+//! - export は **開発者だけ**で、開発者の判定 (移植元の `DEVELOPER_EMAILS`) は auth-worker が済ませる。ここは `X-Tenant-ID` の
+//!   会社 (= export する会社) だけを見る。auth-worker の振り分けの表は、この path を auth-worker 自身 (admin proxy) からだけ回し、
+//!   画面の proxy からは届かない
 //! - `client_secret`・`bot_secret` はここで `SSO_ENCRYPTION_KEY` で暗号化して保存する (rust-alc-api と同じ AES-256-GCM。
 //!   送信の口が同じ鍵で復号する)。空・省略は「変えない」(作成で client secret が無ければ移植元と同じく空文字の暗号文)。
 //!   鍵が無ければ 500 (`message` が `encryption_key_missing`)。DB の失敗は 500 (`message` が `bot_config_failed`)。応答に秘密値は載せない
 //! - SQL はすべてその会社の transaction で tenant_id を明示する (移植元は一覧・更新・削除が RLS 任せだった)
-//! - 移植元の `GET /api/admin/bot/configs/export` (開発者だけ) は移さない (呼び出しが無い)
+//! - export の応答は移植元と同じ形 (`data` の Bot 設定以外の表は空の配列のまま。`exported_at` は秒まで)
 
 use alc_core_wasm::api_error::{bad_request, internal_error_msg, not_found, ApiError};
 use alc_core_wasm::{require_tenant_header, AuthUser, TenantId};
@@ -37,6 +41,7 @@ use crate::routes::SendState;
 
 pub const BOT_CONFIGS_PATH: &str = "/api/admin/bot/configs";
 pub const BOT_CONFIG_PATH: &str = "/api/admin/bot/configs/{id}";
+pub const BOT_CONFIGS_EXPORT_PATH: &str = "/api/admin/bot/configs/export";
 
 pub fn bot_admin_router() -> Router<SendState> {
     Router::new()
@@ -45,6 +50,7 @@ pub fn bot_admin_router() -> Router<SendState> {
             get(list_configs).post(save_config).delete(delete_config),
         )
         .route(BOT_CONFIG_PATH, delete(delete_config_by_path))
+        .route(BOT_CONFIGS_EXPORT_PATH, get(export_configs))
         .route_layer(middleware::from_fn(require_tenant_header))
 }
 
@@ -188,6 +194,40 @@ async fn delete_one(state: &SendState, tenant_id: Uuid, id: Uuid) -> Result<Stat
         .await
         .map_err(|e| state.admin_db_error("delete", &e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 開発者向けの export (移植元 `alc-misc::bot_admin::export_configs` と同じ形)。開発者の判定は auth-worker
+async fn export_configs(
+    State(state): State<SendState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+) -> Result<Json<Value>, ApiError> {
+    let export = pg::bot_admin_export(&mut *state.pg.lock().await, tenant_id)
+        .await
+        .map_err(|e| state.admin_db_error("export", &e))?;
+    let Some(export) = export else {
+        return Err(not_found("tenant_not_found"));
+    };
+    let exported_at = crate::activity::to_datetime((state.now)()).to_rfc3339();
+    Ok(Json(json!({
+        "version": 1,
+        "exported_at": exported_at,
+        "tenant_id": tenant_id.to_string(),
+        "data": {
+            "tenant": export.tenant,
+            "users": [],
+            "employees": [],
+            "devices": [],
+            "tenko_schedules": [],
+            "webhook_configs": [],
+            "tenant_allowed_emails": [],
+            "sso_provider_configs": [],
+            "tenko_call_numbers": [],
+            "tenko_call_drivers": [],
+            "bot_configs": export.configs,
+            "notify_line_configs": [],
+            "notify_recipients": []
+        }
+    })))
 }
 
 #[cfg(test)]

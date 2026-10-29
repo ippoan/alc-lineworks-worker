@@ -237,6 +237,99 @@ pub mod admin_sql {
          SET bot_secret_encrypted = $3 WHERE tenant_id = $1 AND id = $2";
 
     pub const DELETE: &str = "DELETE FROM alc_api.bot_configs WHERE tenant_id = $1 AND id = $2";
+
+    /// export (開発者だけ。開発者の判定は auth-worker): 会社の 1 行 (tenants は RLS の無い表。id で絞る)
+    pub const EXPORT_TENANT: &str =
+        "SELECT id, name, slug, email_domain, created_at FROM alc_api.tenants WHERE id = $1";
+
+    /// export: 会社の Bot 設定の全部の列 (秘密値は暗号文のまま。名前の順。移植元は RLS 任せで WHERE が無かった)
+    pub const EXPORT_CONFIGS: &str =
+        "SELECT id, tenant_id, provider, name, client_id, client_secret_encrypted, \
+         service_account, bot_id, enabled, bot_secret_encrypted, created_at, updated_at \
+         FROM alc_api.bot_configs WHERE tenant_id = $1 ORDER BY name, id";
+}
+
+/// export の会社の 1 行 (移植元の `TenantInfoForExport` と同じ形)
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TenantExport {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: Option<String>,
+    pub email_domain: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// export の Bot 設定の 1 行 (移植元の `BotConfigExportRow` と同じ形。秘密値は暗号文のまま)
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BotExportRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub provider: String,
+    pub name: String,
+    pub client_id: String,
+    pub client_secret_encrypted: String,
+    pub service_account: String,
+    pub bot_id: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_secret_encrypted: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// export の材料 (会社と、その Bot 設定)
+#[derive(Debug, Clone, PartialEq)]
+pub struct BotExport {
+    pub tenant: TenantExport,
+    pub configs: Vec<BotExportRow>,
+}
+
+impl alc_worker_db::TxOutput for BotExport {}
+
+/// export の材料を、その会社の 1 つの transaction で読む。会社が無ければ `None`
+pub async fn bot_admin_export(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Option<BotExport>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 1] =
+                [(&tenant_id, Type::UUID)];
+            let Some(t) = tx
+                .query_typed_opt(admin_sql::EXPORT_TENANT, &params)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let tenant = TenantExport {
+                id: t.get(0),
+                name: t.get(1),
+                slug: t.get(2),
+                email_domain: t.get(3),
+                created_at: t.get(4),
+            };
+            let rows = tx.query_typed(admin_sql::EXPORT_CONFIGS, &params).await?;
+            let configs = rows
+                .iter()
+                .map(|r| BotExportRow {
+                    id: r.get(0),
+                    tenant_id: r.get(1),
+                    provider: r.get(2),
+                    name: r.get(3),
+                    client_id: r.get(4),
+                    client_secret_encrypted: r.get(5),
+                    service_account: r.get(6),
+                    bot_id: r.get(7),
+                    enabled: r.get(8),
+                    bot_secret_encrypted: r.get(9),
+                    created_at: r.get(10),
+                    updated_at: r.get(11),
+                })
+                .collect();
+            Ok(Some(BotExport { tenant, configs }))
+        })
+    })
+    .await
 }
 
 /// Bot 設定の 1 行 (移植元の `BotConfigResponse` と同じ形。秘密値は持たない)
