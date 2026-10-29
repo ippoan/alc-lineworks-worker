@@ -2066,3 +2066,136 @@ async fn bot_admin_delete_by_path() {
     assert_eq!(got.status, 400);
     assert_eq!(got.json()["error"], "invalid_id");
 }
+
+const BOT_CONFIGS_EXPORT: &str = "/api/admin/bot/configs/export";
+
+/// export (開発者だけ。判定は auth-worker): `X-Tenant-ID` の会社の Bot 設定を全部の列で返す (秘密値は暗号文のまま、
+/// bot secret の無い行は欄ごと省く)。形は移植元 (rust-alc-api) と同じで、ほかの表は空の配列
+#[tokio::test]
+async fn bot_admin_export_dumps_the_tenants_configs() {
+    let app = app(Opts::default()).await;
+    let (t, other) = (tenant().await, tenant().await);
+    let second = bot(t, "b-second", "lineworks", true).await;
+    let first = bot(t, "a-first", "line", false).await;
+    bot(other, "z-other", "lineworks", true).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.bot_configs SET bot_secret_encrypted = 'enc-bot-secret' WHERE id = $1",
+            &[&second.id],
+        )
+        .await
+        .unwrap();
+
+    // identity ヘッダーは要らない (X-Tenant-ID だけ)
+    let got = bot_admin_at(&app, BOT_CONFIGS_EXPORT, "GET", Some(t), None, None).await;
+    assert_eq!(got.status, 200);
+    let v = got.json();
+    let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["data", "exported_at", "tenant_id", "version"]);
+    assert_eq!(v["version"], 1);
+    assert_eq!(v["tenant_id"], t.to_string());
+    let at = lineworks::activity::to_datetime(NOW).to_rfc3339();
+    assert_eq!(v["exported_at"], at);
+    let data = v["data"].as_object().unwrap();
+    for empty in [
+        "users",
+        "employees",
+        "devices",
+        "tenko_schedules",
+        "webhook_configs",
+        "tenant_allowed_emails",
+        "sso_provider_configs",
+        "tenko_call_numbers",
+        "tenko_call_drivers",
+        "notify_line_configs",
+        "notify_recipients",
+    ] {
+        assert_eq!(data[empty], serde_json::json!([]), "{empty}");
+    }
+    assert_eq!(data.len(), 13);
+    let tenant = &data["tenant"];
+    let mut tkeys: Vec<_> = tenant.as_object().unwrap().keys().cloned().collect();
+    tkeys.sort();
+    assert_eq!(tkeys, ["created_at", "email_domain", "id", "name", "slug"]);
+    assert_eq!(tenant["id"], t.to_string());
+
+    let configs = data["bot_configs"].as_array().unwrap();
+    let names: Vec<_> = configs.iter().map(|c| c["name"].clone()).collect();
+    assert_eq!(names, ["a-first", "b-second"]);
+    let a = &configs[0];
+    assert_eq!(a["id"], first.id.to_string());
+    assert_eq!(a["tenant_id"], t.to_string());
+    assert_eq!(a["provider"], "line");
+    assert_eq!(a["enabled"], false);
+    assert_eq!(
+        decrypt(a["client_secret_encrypted"].as_str().unwrap()),
+        "secret-a-first"
+    );
+    assert!(a.get("bot_secret_encrypted").is_none());
+    assert_eq!(configs[1]["bot_secret_encrypted"], "enc-bot-secret");
+    let mut ckeys: Vec<_> = configs[1].as_object().unwrap().keys().cloned().collect();
+    ckeys.sort();
+    assert_eq!(
+        ckeys,
+        [
+            "bot_id",
+            "bot_secret_encrypted",
+            "client_id",
+            "client_secret_encrypted",
+            "created_at",
+            "enabled",
+            "id",
+            "name",
+            "provider",
+            "service_account",
+            "tenant_id",
+            "updated_at"
+        ]
+    );
+}
+
+/// export: 会社が無い → 404 `tenant_not_found`、tenant ヘッダーが無い → 401、DB の失敗 → 500 (ログは段と kind)
+#[tokio::test]
+async fn bot_admin_export_errors() {
+    let app = app(Opts::default()).await;
+    let got = bot_admin_at(
+        &app,
+        BOT_CONFIGS_EXPORT,
+        "GET",
+        Some(Uuid::new_v4()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    assert_eq!(
+        got.json(),
+        serde_json::json!({ "error": "tenant_not_found" })
+    );
+    let got = bot_admin_at(&app, BOT_CONFIGS_EXPORT, "GET", None, None, None).await;
+    assert_eq!(got.status, 401);
+
+    let broken = build(broken_client().await, Opts::default());
+    let got = bot_admin_at(
+        &broken,
+        BOT_CONFIGS_EXPORT,
+        "GET",
+        Some(Uuid::new_v4()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 500);
+    assert_eq!(
+        got.json(),
+        serde_json::json!({"error": "internal_error", "message": "bot_config_failed"})
+    );
+    let logs = broken.logs.lock().unwrap().clone();
+    assert_eq!(logs.len(), 1);
+    assert!(
+        logs[0].starts_with("bot-admin: export failed: db ("),
+        "{logs:?}"
+    );
+}
