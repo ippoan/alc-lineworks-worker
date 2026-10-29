@@ -5,7 +5,7 @@
 //! **この Worker は呼び手を認証しない。** 本番・staging とも workers.dev を開けず (`workers_dev` / `preview_urls` = false、
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
-//! 秘密値は Secrets Store から、6 つの口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client_secret の復号) と
+//! 秘密値は Secrets Store から、[`lineworks::SECRET_PATHS`] の口へのリクエストでだけ引く: `SSO_ENCRYPTION_KEY` (client / bot secret の復号・暗号化) と
 //! `LINEWORKS_PRIVATE_KEY` (JWT の署名。全 bot で共有する 1 本)。LINE WORKS の access token は isolate の中で使い回す。
 //!
 //! デプロイの確認の口 (`GET /api/lineworks/deploy-check?to=`) の送り先は query の `to` (tenant は auth-worker の
@@ -28,10 +28,7 @@ use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
 use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, TokenCache};
-use lineworks::{
-    router, DeployCheck, LogSink, SendState, DEPLOY_CHECK_PATH, LOGIN_ACTIVITY_PATH, MESSAGES_PATH,
-    SEND_PATH, TOKEN_PATH, USERS_PATH,
-};
+use lineworks::{router, DeployCheck, LogSink, SendState, SECRET_PATHS};
 use tower_service::Service;
 use worker::{
     console_error, event, Context, Date, Env, HttpRequest, Result, WorkerVersionMetadata,
@@ -55,16 +52,6 @@ fn activity_cache() -> Arc<ActivityCache> {
     static CACHE: OnceLock<Arc<ActivityCache>> = OnceLock::new();
     CACHE.get_or_init(Arc::default).clone()
 }
-
-/// 秘密値を引く口 (ほかの path では Secrets Store を読まない)
-const SECRET_PATHS: [&str; 6] = [
-    SEND_PATH,
-    DEPLOY_CHECK_PATH,
-    TOKEN_PATH,
-    MESSAGES_PATH,
-    USERS_PATH,
-    LOGIN_ACTIVITY_PATH,
-];
 
 /// 今の UNIX 秒 (JS の Date)
 fn now_secs() -> u64 {
