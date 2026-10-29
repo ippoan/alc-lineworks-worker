@@ -23,6 +23,7 @@ use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use lineworks::activity::ActivityCache;
 use lineworks::client::{Endpoints, Http, HttpError, HttpRequest, HttpResponse, TokenCache};
+pub use lineworks::CHANNEL_INFO_PATH;
 use lineworks::{
     router, DeployCheck, SendState, SentRecord, DEPLOY_CHECK_PATH, LOGIN_ACTIVITY_PATH,
     MESSAGES_PATH, SEND_PATH, TOKEN_PATH, USERS_PATH,

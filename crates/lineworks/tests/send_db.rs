@@ -2199,3 +2199,72 @@ async fn bot_admin_export_errors() {
         "{logs:?}"
     );
 }
+
+// ---- channel-info (トークルームの名前) ----
+
+/// トークルームの名前: tenant の bot の token (scope `bot`) で `…/bots/{bot_id}/channels/{channel_id}` を読み、`title` だけを返す。
+/// 名前が無い・空白だけは `null`。`channel_id` が無ければ 400、tenant が無ければ 401、権限で断られたら 403 `missing_scope` (`bot`)
+#[tokio::test]
+async fn channel_info_title_and_errors() {
+    let t = tenant().await;
+    let b = bot(t, "main", "lineworks", true).await;
+    let url = |ch: &str| format!("{BOTS_URL}{}/channels/{ch}", b.bot_id);
+    let app = app(Opts {
+        http: FakeLineworks::default()
+            .on_get(
+                &url("ch-1"),
+                200,
+                r#"{"domainId":1,"channelId":"ch-1","title":"勤怠通知","channelType":{"type":"GROUP"}}"#,
+                None,
+            )
+            .on_get(&url("ch-2"), 200, r#"{"channelId":"ch-2","title":" "}"#, None)
+            .on_get(&url("ch-3"), 403, r#"{"code":"FORBIDDEN"}"#, None),
+        ..Default::default()
+    })
+    .await;
+    let tid = t.to_string();
+    let info = |q: &str| {
+        let (app, tid, q) = (&app, tid.clone(), q.to_owned());
+        async move { get_path(app, CHANNEL_INFO_PATH, Some(&tid), &q).await }
+    };
+
+    let got = info("channel_id=ch-1").await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, serde_json::json!({"title": "勤怠通知"}))
+    );
+    let got = info(&format!("channel_id=ch-2&bot_config_id={}", b.id)).await;
+    assert_eq!(
+        (got.status, got.json()),
+        (200, serde_json::json!({"title": null}))
+    );
+    let got = info("channel_id=ch-3").await;
+    assert_eq!(
+        (
+            got.status,
+            got.json()["error"].clone(),
+            got.json()["scope"].clone()
+        ),
+        (
+            403,
+            serde_json::json!("missing_scope"),
+            serde_json::json!("bot")
+        )
+    );
+    assert_eq!(app.http.token_scopes(), ["bot"]);
+    let gets = app.http.seen_gets.lock().unwrap().clone();
+    assert_eq!(gets.len(), 3);
+    assert_eq!(gets[0].0, url("ch-1"));
+
+    for q in ["", "channel_id=%20"] {
+        let got = info(q).await;
+        assert_eq!(got.status, 400, "{q}");
+        assert_eq!(got.json()["error"], "channel_id_required");
+    }
+    assert_eq!(
+        get_path(&app, CHANNEL_INFO_PATH, None, "channel_id=ch-1")
+            .await
+            .status,
+        401
+    );
+}

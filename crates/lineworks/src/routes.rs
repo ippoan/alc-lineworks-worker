@@ -48,6 +48,14 @@
 //!   403 `missing_scope` (`audit.read`) / 502 `upstream_error`、CSV の見出しが読めない → 502 `csv_columns_not_recognized`
 //!   (`message` は固定の語。rust と違い見出しの中身は載せない)。message の監査ログと掲示板は best-effort
 //!
+//! ## `GET /api/internal/lineworks/channel-info?channel_id=…[&bot_config_id=]`
+//!
+//! トークルームの名前 (`GET …/bots/{bot_id}/channels/{channel_id}`、scope `bot`)。alc-notify が bot の招待のイベント
+//! (名前を持たない) でトークルームを足すときに呼ぶ (Service Binding 専用)。
+//! - tenant と bot は users の口と同じ (`bot_config_id` はそのトークルームに居る bot)
+//! - 応答: 200 `{"title": "…"}` (名前が無ければ `null`)。`channel_id` が無い・空は 400 `channel_id_required`
+//! - LINE WORKS が権限で断った → 403 `missing_scope` (`bot`)、ほかは 502 `upstream_error`
+//!
 //! ログに出すのは固定の語・段の名前・DB のエラーの kind・HTTP の status まで (行 id・本文・token・secret を出さない)。
 
 use std::sync::Arc;
@@ -67,7 +75,7 @@ use uuid::Uuid;
 use crate::activity::{self, ActivityCache, ActivityError, LoginActivityEntry, DEFAULT_DAYS};
 use crate::client::{
     Client, Content, Credentials, Destination, Endpoints, Http, LineworksMember, SendError,
-    TokenCache, ALLOWED_SCOPES, AUDIT_SCOPE, DIRECTORY_SCOPE,
+    TokenCache, ALLOWED_SCOPES, AUDIT_SCOPE, DIRECTORY_SCOPE, SEND_SCOPE,
 };
 use crate::deploy_check::{self, DeployCheck, DEPLOY_CHECK_PATH};
 use crate::pg::{self, BotConfigRow, RecipientRow};
@@ -77,17 +85,19 @@ pub const TOKEN_PATH: &str = "/api/internal/lineworks/token";
 pub const MESSAGES_PATH: &str = "/api/internal/lineworks/messages";
 pub const USERS_PATH: &str = "/api/internal/lineworks/users";
 pub const LOGIN_ACTIVITY_PATH: &str = "/api/internal/lineworks/login-activity";
+pub const CHANNEL_INFO_PATH: &str = "/api/internal/lineworks/channel-info";
 
 /// Secrets Store の秘密値 (`SSO_ENCRYPTION_KEY`・`LINEWORKS_PRIVATE_KEY`) を引く口 (worker 本体の `src/lib.rs` が見る。
 /// ほかの path では Secrets Store を読まず、[`SendState`] の `sso_key`・`private_key` は `None`)。
 /// `sso_key`・`private_key` を使う口を足したらここにも足す (Bot 設定の保存は暗号化に `sso_key` を使う)
-pub const SECRET_PATHS: [&str; 7] = [
+pub const SECRET_PATHS: [&str; 8] = [
     SEND_PATH,
     DEPLOY_CHECK_PATH,
     TOKEN_PATH,
     MESSAGES_PATH,
     USERS_PATH,
     LOGIN_ACTIVITY_PATH,
+    CHANNEL_INFO_PATH,
     crate::bot_admin::BOT_CONFIGS_PATH,
 ];
 
@@ -121,6 +131,7 @@ pub fn router() -> Router<SendState> {
         .route(MESSAGES_PATH, post(send_message))
         .route(USERS_PATH, get(list_users))
         .route(LOGIN_ACTIVITY_PATH, get(login_activity))
+        .route(CHANNEL_INFO_PATH, get(channel_info))
         .route_layer(middleware::from_fn(require_tenant_header));
     Router::new()
         .route(SEND_PATH, post(send_text))
@@ -185,6 +196,14 @@ pub struct TokenBody {
 
 #[derive(Debug, Deserialize)]
 pub struct UsersQuery {
+    #[serde(default)]
+    pub bot_config_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChannelInfoQuery {
+    #[serde(default)]
+    pub channel_id: Option<String>,
     #[serde(default)]
     pub bot_config_id: Option<Uuid>,
 }
@@ -501,6 +520,25 @@ async fn list_users(
         .await
         .map_err(|e| state.read_failed(e, DIRECTORY_SCOPE))?;
     Ok(Json(members))
+}
+
+async fn channel_info(
+    State(state): State<SendState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Query(q): Query<ChannelInfoQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let channel_id = q
+        .channel_id
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| bad_request("channel_id_required", "channel_id is required"))?;
+    let bot = state.tenant_bot(tenant_id, q.bot_config_id).await?;
+    let (creds, private_key) = state.credentials(bot)?;
+    let title = state
+        .client()
+        .channel_title(&creds, &private_key, &channel_id)
+        .await
+        .map_err(|e| state.read_failed(e, SEND_SCOPE))?;
+    Ok(Json(serde_json::json!({ "title": title })))
 }
 
 async fn login_activity(
