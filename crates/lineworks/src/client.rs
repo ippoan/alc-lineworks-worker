@@ -438,6 +438,24 @@ impl Client<'_> {
         serde_json::from_slice(&body).map_err(|_| SendError::ReadParse(stage))
     }
 
+    /// トークルームの名前 (`GET …/bots/{bot_id}/channels/{channel_id}`、scope `bot`)。名前が無い・空白だけなら `None`
+    pub async fn channel_title(
+        &self,
+        creds: &Credentials,
+        private_key_pem: &str,
+        channel_id: &str,
+    ) -> Result<Option<String>, SendError> {
+        let (token, _) = self
+            .access_token(creds, private_key_pem, SEND_SCOPE)
+            .await?;
+        let url = format!(
+            "{}{}/channels/{channel_id}",
+            self.endpoints.bots, creds.bot_id
+        );
+        let info: ChannelInfoResponse = self.get_json(url, &token, "channel").await?;
+        Ok(info.title.filter(|t| !t.trim().is_empty()))
+    }
+
     /// 組織のメンバーの一覧 (scope `directory.read`。`responseMetaData.nextCursor` が無くなるまで全ページ。rust の `list_org_users`)
     pub async fn list_org_users(
         &self,
@@ -551,6 +569,13 @@ pub struct LineworksMember {
     pub user_id: String,
     pub user_name: Option<String>,
     pub email: Option<String>,
+}
+
+/// トークルームの情報のうち使う項目 (名前だけ)
+#[derive(Deserialize)]
+struct ChannelInfoResponse {
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
