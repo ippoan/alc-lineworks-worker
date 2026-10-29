@@ -78,6 +78,19 @@ pub const MESSAGES_PATH: &str = "/api/internal/lineworks/messages";
 pub const USERS_PATH: &str = "/api/internal/lineworks/users";
 pub const LOGIN_ACTIVITY_PATH: &str = "/api/internal/lineworks/login-activity";
 
+/// Secrets Store の秘密値 (`SSO_ENCRYPTION_KEY`・`LINEWORKS_PRIVATE_KEY`) を引く口 (worker 本体の `src/lib.rs` が見る。
+/// ほかの path では Secrets Store を読まず、[`SendState`] の `sso_key`・`private_key` は `None`)。
+/// `sso_key`・`private_key` を使う口を足したらここにも足す (Bot 設定の保存は暗号化に `sso_key` を使う)
+pub const SECRET_PATHS: [&str; 7] = [
+    SEND_PATH,
+    DEPLOY_CHECK_PATH,
+    TOKEN_PATH,
+    MESSAGES_PATH,
+    USERS_PATH,
+    LOGIN_ACTIVITY_PATH,
+    crate::bot_admin::BOT_CONFIGS_PATH,
+];
+
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub type Now = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -560,6 +573,13 @@ mod tests {
 
     fn err(r: ApiError) -> (u16, serde_json::Value) {
         (r.0.as_u16(), r.1 .0)
+    }
+
+    /// Bot 設定の保存 (`POST /api/admin/bot/configs`) は暗号化に `sso_key` を使う。一覧に無いと本番で鍵が渡らず必ず 500
+    #[test]
+    fn secret_paths_cover_bot_configs() {
+        assert!(SECRET_PATHS.contains(&crate::bot_admin::BOT_CONFIGS_PATH));
+        assert!(!SECRET_PATHS.contains(&crate::bot_admin::BOT_CONFIG_PATH));
     }
 
     #[test]

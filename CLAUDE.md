@@ -26,6 +26,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - token の口の scope は `client::ALLOWED_SCOPES` だけ。足すときは auth-worker の使う値を確かめる。
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/lineworks/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。WHERE に tenant_id も明示する。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 44・send_db 27) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 45・send_db 27) はテストを足したら上げる。
 - public repo: ホスト名・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-core-wasm・alc-worker-db・alc-worker-crypto が同じ rev。`cargo tree -i` で出どころが 1 つ)。
